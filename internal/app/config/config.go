@@ -2,12 +2,14 @@
 package config
 
 import (
+	"context"
 	"log"
 	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/terratensor/geoupdater/internal/adapters/logger"
+	"github.com/terratensor/geoupdater/internal/adapters/manticore"
 	"github.com/terratensor/geoupdater/internal/adapters/ndjson"
 	"github.com/terratensor/geoupdater/internal/core/ports"
 )
@@ -120,4 +122,20 @@ func (c *Config) CreateParser(logger ports.Logger, metrics ports.MetricsCollecto
 
 	factory := ndjson.NewFactory()
 	return factory.Create(parserCfg, logger, metrics)
+}
+
+// CreateManticoreClient создает Manticore клиент из конфигурации
+func (c *Config) CreateManticoreClient(logger ports.Logger, metrics ports.MetricsCollector) (*manticore.Client, error) {
+	manticoreCfg := &manticore.Config{
+		Host:       c.ManticoreHost,
+		Port:       c.ManticorePort,
+		TableName:  c.ManticoreTable,
+		Timeout:    c.ManticoreTimeout,
+		MaxConns:   c.ManticoreMaxConns,
+		RetryCount: c.MaxRetries,
+		RetryDelay: c.RetryDelay,
+	}
+
+	factory := manticore.NewFactory()
+	return factory.Create(context.Background(), manticoreCfg, logger, metrics)
 }
