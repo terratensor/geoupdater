@@ -141,8 +141,8 @@ func (c *Client) getDocument(ctx context.Context, id string) (*domain.Document, 
 		return nil, err
 	}
 
-	// Парсим ответ
-	return c.parseSQLResponse(resp, id)
+	// Парсим ответ - resp это *SqlResponse, передаем его значение
+	return c.parseSQLResponse(*resp, id)
 }
 
 // GetDocumentsBatch получает пачку документов по списку ID через один SQL запрос
@@ -184,7 +184,8 @@ func (c *Client) getDocumentsBatch(ctx context.Context, ids []string) (map[strin
 		return nil, err
 	}
 
-	return c.parseSQLResponseArray(resp)
+	// resp это *SqlResponse, передаем его значение
+	return c.parseSQLResponseArray(*resp)
 }
 
 // ReplaceDocument заменяет документ полностью через REPLACE
@@ -211,13 +212,12 @@ func (c *Client) replaceDocument(ctx context.Context, doc *domain.Document) erro
 	// Создаем запрос на replace через JSON API
 	replaceRequest := Manticoresearch.NewInsertDocumentRequest(c.tableName, doc.ToMap())
 
-	// Устанавливаем ID если есть
+	// Устанавливаем ID если есть - конвертируем string в uint64
 	if doc.ID != "" {
-		// ID может быть числом или строкой, конвертируем в int64
-		var idInt int64
-		fmt.Sscanf(doc.ID, "%d", &idInt)
-		if idInt > 0 {
-			replaceRequest.SetId(idInt)
+		var idUint uint64
+		fmt.Sscanf(doc.ID, "%d", &idUint)
+		if idUint > 0 {
+			replaceRequest.SetId(idUint)
 		}
 	}
 
@@ -290,10 +290,10 @@ func (c *Client) bulkReplaceBatch(ctx context.Context, docs []*domain.Document) 
 		// { "replace" : { "table" : "table_name", "id" : id, "doc": { ... } } }
 		docMap := doc.ToMap()
 
-		// Конвертируем ID в int64
-		var idInt int64
+		// Конвертируем ID в uint64
+		var idUint uint64
 		if doc.ID != "" {
-			fmt.Sscanf(doc.ID, "%d", &idInt)
+			fmt.Sscanf(doc.ID, "%d", &idUint)
 		}
 
 		// Убираем ID из doc, так как он передается отдельно
@@ -301,8 +301,8 @@ func (c *Client) bulkReplaceBatch(ctx context.Context, docs []*domain.Document) 
 
 		replaceOp := map[string]interface{}{
 			"replace": map[string]interface{}{
-				"table": c.tableName,
-				"id":    idInt,
+				"index": c.tableName, // В bulk API используется "index", а не "table"
+				"id":    idUint,
 				"doc":   docMap,
 			},
 		}
@@ -374,6 +374,22 @@ func (c *Client) parseSQLResponse(resp Manticoresearch.SqlResponse, id string) (
 		}
 	}
 
+	// Пробуем получить как объект SqlObjResponse
+	if obj, ok := actual.(Manticoresearch.SqlObjResponse); ok {
+		hits := obj.GetHits()
+		if hits != nil {
+			if hitsArr, ok := hits["hits"].([]interface{}); ok && len(hitsArr) > 0 {
+				if hit, ok := hitsArr[0].(map[string]interface{}); ok {
+					if source, ok := hit["_source"]; ok {
+						if sourceMap, ok := source.(map[string]interface{}); ok {
+							return c.mapToDocument(sourceMap), nil
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return nil, ports.ErrNotFound
 }
 
@@ -383,11 +399,34 @@ func (c *Client) parseSQLResponseArray(resp Manticoresearch.SqlResponse) (map[st
 
 	actual := resp.GetActualInstance()
 
+	// Пробуем получить как массив
 	if arr, ok := actual.([]map[string]interface{}); ok {
 		for _, row := range arr {
 			doc := c.mapToDocument(row)
 			if doc != nil && doc.ID != "" {
 				result[doc.ID] = doc
+			}
+		}
+		return result, nil
+	}
+
+	// Пробуем получить как объект SqlObjResponse
+	if obj, ok := actual.(Manticoresearch.SqlObjResponse); ok {
+		hits := obj.GetHits()
+		if hits != nil {
+			if hitsArr, ok := hits["hits"].([]interface{}); ok {
+				for _, hitItem := range hitsArr {
+					if hit, ok := hitItem.(map[string]interface{}); ok {
+						if source, ok := hit["_source"]; ok {
+							if sourceMap, ok := source.(map[string]interface{}); ok {
+								doc := c.mapToDocument(sourceMap)
+								if doc != nil && doc.ID != "" {
+									result[doc.ID] = doc
+								}
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -461,8 +500,22 @@ func (c *Client) mapToDocument(data map[string]interface{}) *domain.Document {
 				}
 			}
 		case string:
-			// Иногда MVA может приходить как строка
-			// TODO: парсить строку
+			// Иногда MVA может приходить как строка, парсим
+			if v != "" && v != "()" {
+				// Убираем скобки и разбиваем по запятой
+				trimmed := strings.Trim(v, "()")
+				if trimmed != "" {
+					parts := strings.Split(trimmed, ",")
+					doc.GeohashesUint64 = make([]int64, 0, len(parts))
+					for _, part := range parts {
+						var num int64
+						fmt.Sscanf(strings.TrimSpace(part), "%d", &num)
+						if num > 0 {
+							doc.GeohashesUint64 = append(doc.GeohashesUint64, num)
+						}
+					}
+				}
+			}
 		}
 	}
 
