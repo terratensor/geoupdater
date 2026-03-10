@@ -18,7 +18,7 @@ func TestParseLine(t *testing.T) {
 	tests := []struct {
 		name        string
 		line        string
-		wantDocID   string
+		wantDocID   uint64 // Меняем тип на uint64
 		wantStrings int
 		wantUint64  int
 		wantErr     bool
@@ -26,7 +26,7 @@ func TestParseLine(t *testing.T) {
 		{
 			name:        "valid line",
 			line:        `{"doc_id":"123","geohashes_string":["abc","def"],"geohashes_uint64":[123,456]}`,
-			wantDocID:   "123",
+			wantDocID:   123, // Убираем кавычки
 			wantStrings: 2,
 			wantUint64:  2,
 			wantErr:     false,
@@ -51,6 +51,14 @@ func TestParseLine(t *testing.T) {
 			line:    `{"doc_id":"123","geohashes_string":[],"geohashes_uint64":[]}`,
 			wantErr: true,
 		},
+		{
+			name:        "doc_id as number",
+			line:        `{"doc_id":456,"geohashes_string":["abc"],"geohashes_uint64":[123]}`,
+			wantDocID:   456,
+			wantStrings: 1,
+			wantUint64:  1,
+			wantErr:     false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -69,8 +77,9 @@ func TestParseLine(t *testing.T) {
 				return
 			}
 
+			// Сравниваем uint64 с uint64
 			if data.DocID != tt.wantDocID {
-				t.Errorf("doc_id = %s, want %s", data.DocID, tt.wantDocID)
+				t.Errorf("doc_id = %d, want %d", data.DocID, tt.wantDocID)
 			}
 
 			if len(data.GeohashesString) != tt.wantStrings {
@@ -120,7 +129,7 @@ func TestParseFile(t *testing.T) {
 	// Собираем данные
 	for data := range dataChan {
 		count++
-		if data.DocID == "" {
+		if data.DocID == 0 { // Сравниваем с 0, а не с пустой строкой
 			t.Error("received data with empty doc_id")
 		}
 	}
@@ -280,8 +289,11 @@ func TestParseReader(t *testing.T) {
 	dataChan, errChan := parser.ParseReader(ctx, content)
 
 	var count int
-	for range dataChan {
+	for data := range dataChan {
 		count++
+		if data.DocID == 0 { // Сравниваем с 0
+			t.Error("received data with empty doc_id")
+		}
 	}
 
 	if count != 2 {
@@ -340,6 +352,7 @@ func TestFindFiles(t *testing.T) {
 	}
 }
 
+// internal/adapters/ndjson/parser_test.go - исправленная версия теста
 func TestContextCancellation(t *testing.T) {
 	tmpfile, err := os.CreateTemp("", "test*.ndjson")
 	if err != nil {
@@ -347,10 +360,11 @@ func TestContextCancellation(t *testing.T) {
 	}
 	defer os.Remove(tmpfile.Name())
 
-	// Большой файл для имитации долгой обработки
+	// УВЕЛИЧИВАЕМ РАЗМЕР ФАЙЛА для гарантии, что обработка не завершится до таймаута
+	// Создаём файл с 1,000,000 строк вместо 10,000
 	var lines []string
-	for i := 0; i < 10000; i++ {
-		lines = append(lines, `{"doc_id":"1","geohashes_string":["abc"],"geohashes_uint64":[123]}`)
+	for i := 0; i < 1000000; i++ {
+		lines = append(lines, `{"doc_id":123456,"geohashes_string":["abc"],"geohashes_uint64":[123]}`)
 	}
 	content := strings.Join(lines, "\n")
 
@@ -365,8 +379,12 @@ func TestContextCancellation(t *testing.T) {
 
 	parser := NewParser(DefaultConfig(), log, nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	// Устанавливаем очень маленький таймаут, чтобы гарантированно не успеть обработать весь файл
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
 	defer cancel()
+
+	// Даем контексту немного времени, чтобы "осознать" таймаут
+	time.Sleep(2 * time.Millisecond)
 
 	dataChan, errChan := parser.ParseFile(ctx, tmpfile.Name())
 
@@ -379,5 +397,10 @@ func TestContextCancellation(t *testing.T) {
 	err = <-errChan
 	if err == nil {
 		t.Error("expected context error, got nil")
+	} else if !strings.Contains(err.Error(), "context deadline exceeded") &&
+		!strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("expected context error, got: %v", err)
 	}
+
+	t.Logf("Processed %d lines before cancellation", count)
 }

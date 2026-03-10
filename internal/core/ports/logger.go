@@ -1,4 +1,4 @@
-// internal/core/ports/logger.go
+// internal/core/ports/logger.go - добавляем Uint64Field
 package ports
 
 import (
@@ -8,28 +8,13 @@ import (
 
 // Logger определяет интерфейс для логирования
 type Logger interface {
-	// Debug логирует отладочное сообщение
 	Debug(msg string, fields ...Field)
-
-	// Info логирует информационное сообщение
 	Info(msg string, fields ...Field)
-
-	// Warn логирует предупреждение
 	Warn(msg string, fields ...Field)
-
-	// Error логирует ошибку
 	Error(msg string, fields ...Field)
-
-	// Fatal логирует фатальную ошибку и завершает программу
 	Fatal(msg string, fields ...Field)
-
-	// With создает дочерний логгер с дополнительными полями
 	With(fields ...Field) Logger
-
-	// WithContext создает логгер с контекстом
 	WithContext(ctx context.Context) Logger
-
-	// Sync сбрасывает буферы логов
 	Sync() error
 }
 
@@ -68,6 +53,16 @@ type Int64Field struct {
 func (f Int64Field) Key() string               { return f.key }
 func (f Int64Field) Value() interface{}        { return f.value }
 func Int64(key string, value int64) Int64Field { return Int64Field{key, value} }
+
+// Uint64Field поле для uint64
+type Uint64Field struct {
+	key   string
+	value uint64
+}
+
+func (f Uint64Field) Key() string                 { return f.key }
+func (f Uint64Field) Value() interface{}          { return f.value }
+func Uint64(key string, value uint64) Uint64Field { return Uint64Field{key, value} }
 
 // Float64Field поле для float64
 type Float64Field struct {

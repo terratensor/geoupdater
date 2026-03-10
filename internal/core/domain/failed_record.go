@@ -1,9 +1,10 @@
-// internal/core/domain/failed_record.go
+// internal/core/domain/failed_record.go - исправляем Key()
 package domain
 
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -55,5 +56,5 @@ func FailedRecordFromJSON(data []byte) (*FailedRecord, error) {
 
 // Key возвращает уникальный ключ для записи (для дедупликации)
 func (f *FailedRecord) Key() string {
-	return f.Data.DocID
+	return strconv.FormatUint(f.Data.DocID, 10) // конвертируем uint64 в string
 }

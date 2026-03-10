@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,11 +18,12 @@ import (
 
 // Client реализует ports.Repository для Manticore Search
 type Client struct {
-	apiClient *Manticoresearch.APIClient
-	config    *Config
-	logger    ports.Logger
-	metrics   ports.MetricsCollector
-	tableName string
+	apiClient  *Manticoresearch.APIClient
+	config     *Config
+	logger     ports.Logger
+	metrics    ports.MetricsCollector
+	tableName  string
+	httpClient *http.Client
 }
 
 // Config конфигурация Manticore клиента
@@ -53,18 +56,26 @@ func NewClient(cfg *Config, logger ports.Logger, metrics ports.MetricsCollector)
 		cfg = DefaultConfig()
 	}
 
+	// Создаем HTTP клиент с таймаутом
+	httpClient := &http.Client{
+		Timeout: cfg.Timeout,
+	}
+
+	// Создаем конфигурацию для Manticore клиента
 	configuration := Manticoresearch.NewConfiguration()
+	configuration.HTTPClient = httpClient
 	configuration.Servers[0].URL = fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
-	configuration.HTTPClient.Timeout = cfg.Timeout
+	configuration.UserAgent = "GeoUpdater/1.0"
 
 	apiClient := Manticoresearch.NewAPIClient(configuration)
 
 	client := &Client{
-		apiClient: apiClient,
-		config:    cfg,
-		logger:    logger,
-		metrics:   metrics,
-		tableName: cfg.TableName,
+		apiClient:  apiClient,
+		config:     cfg,
+		logger:     logger,
+		metrics:    metrics,
+		tableName:  cfg.TableName,
+		httpClient: httpClient,
 	}
 
 	// Проверяем соединение
@@ -76,6 +87,7 @@ func NewClient(cfg *Config, logger ports.Logger, metrics ports.MetricsCollector)
 		ports.String("host", cfg.Host),
 		ports.Int("port", cfg.Port),
 		ports.String("table", cfg.TableName),
+		ports.String("url", configuration.Servers[0].URL),
 	)
 
 	return client, nil
@@ -104,8 +116,8 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
-// GetDocument получает документ по ID через SQL запрос
-func (c *Client) GetDocument(ctx context.Context, id string) (*domain.Document, error) {
+// GetDocument получает документ по ID
+func (c *Client) GetDocument(ctx context.Context, id uint64) (*domain.Document, error) {
 	start := time.Now()
 
 	var doc *domain.Document
@@ -125,35 +137,34 @@ func (c *Client) GetDocument(ctx context.Context, id string) (*domain.Document, 
 		if strings.Contains(err.Error(), "not found") {
 			return nil, ports.ErrNotFound
 		}
-		return nil, fmt.Errorf("failed to get document %s: %w", id, err)
+		return nil, fmt.Errorf("failed to get document %d: %w", id, err)
 	}
 
 	return doc, nil
 }
 
 // getDocument внутренний метод для получения документа через SQL
-func (c *Client) getDocument(ctx context.Context, id string) (*domain.Document, error) {
-	// Используем SQL запрос для получения документа
-	query := fmt.Sprintf("SELECT * FROM %s WHERE id = %s LIMIT 1", c.tableName, id)
+func (c *Client) getDocument(ctx context.Context, id uint64) (*domain.Document, error) {
+	// В SQL запросе ID нужно использовать как есть (uint64)
+	query := fmt.Sprintf("SELECT * FROM %s WHERE id = %d LIMIT 1", c.tableName, id)
 
 	resp, _, err := c.apiClient.UtilsAPI.Sql(ctx).Body(query).RawResponse(false).Execute()
 	if err != nil {
 		return nil, err
 	}
 
-	// Парсим ответ - resp это *SqlResponse, передаем его значение
 	return c.parseSQLResponse(*resp, id)
 }
 
-// GetDocumentsBatch получает пачку документов по списку ID через один SQL запрос
-func (c *Client) GetDocumentsBatch(ctx context.Context, ids []string) (map[string]*domain.Document, error) {
+// GetDocumentsBatch получает пачку документов по списку ID
+func (c *Client) GetDocumentsBatch(ctx context.Context, ids []uint64) (map[uint64]*domain.Document, error) {
 	start := time.Now()
 
 	if len(ids) == 0 {
-		return make(map[string]*domain.Document), nil
+		return make(map[uint64]*domain.Document), nil
 	}
 
-	var result map[string]*domain.Document
+	var result map[uint64]*domain.Document
 	var err error
 
 	operation := func() error {
@@ -174,9 +185,14 @@ func (c *Client) GetDocumentsBatch(ctx context.Context, ids []string) (map[strin
 }
 
 // getDocumentsBatch внутренний метод для получения пачки документов через SQL IN
-func (c *Client) getDocumentsBatch(ctx context.Context, ids []string) (map[string]*domain.Document, error) {
-	// Формируем список ID для IN запроса
-	idList := strings.Join(ids, ",")
+func (c *Client) getDocumentsBatch(ctx context.Context, ids []uint64) (map[uint64]*domain.Document, error) {
+	// Конвертируем []uint64 в строку для SQL IN
+	idStrings := make([]string, len(ids))
+	for i, id := range ids {
+		idStrings[i] = strconv.FormatUint(id, 10)
+	}
+	idList := strings.Join(idStrings, ",")
+
 	query := fmt.Sprintf("SELECT * FROM %s WHERE id IN (%s)", c.tableName, idList)
 
 	resp, _, err := c.apiClient.UtilsAPI.Sql(ctx).Body(query).RawResponse(false).Execute()
@@ -184,7 +200,6 @@ func (c *Client) getDocumentsBatch(ctx context.Context, ids []string) (map[strin
 		return nil, err
 	}
 
-	// resp это *SqlResponse, передаем его значение
 	return c.parseSQLResponseArray(*resp)
 }
 
@@ -201,7 +216,7 @@ func (c *Client) ReplaceDocument(ctx context.Context, doc *domain.Document) erro
 	c.metrics.RecordManticoreOperation("replace", time.Since(start), err)
 
 	if err != nil {
-		return fmt.Errorf("failed to replace document %s: %w", doc.ID, err)
+		return fmt.Errorf("failed to replace document %d: %w", doc.ID, err)
 	}
 
 	return nil
@@ -210,16 +225,13 @@ func (c *Client) ReplaceDocument(ctx context.Context, doc *domain.Document) erro
 // replaceDocument внутренний метод для замены документа через JSON REPLACE
 func (c *Client) replaceDocument(ctx context.Context, doc *domain.Document) error {
 	// Создаем запрос на replace через JSON API
-	replaceRequest := Manticoresearch.NewInsertDocumentRequest(c.tableName, doc.ToMap())
+	docMap := doc.ToMap()
 
-	// Устанавливаем ID если есть - конвертируем string в uint64
-	if doc.ID != "" {
-		var idUint uint64
-		fmt.Sscanf(doc.ID, "%d", &idUint)
-		if idUint > 0 {
-			replaceRequest.SetId(idUint)
-		}
-	}
+	// Для JSON API ID должен быть в поле id верхнего уровня, не в doc
+	delete(docMap, "id") // убираем id из doc
+
+	replaceRequest := Manticoresearch.NewInsertDocumentRequest(c.tableName, docMap)
+	replaceRequest.SetId(doc.ID) // ID передаем отдельно как uint64
 
 	_, _, err := c.apiClient.IndexAPI.Replace(ctx).InsertDocumentRequest(*replaceRequest).Execute()
 	if err != nil {
@@ -227,14 +239,14 @@ func (c *Client) replaceDocument(ctx context.Context, doc *domain.Document) erro
 	}
 
 	c.logger.Debug("document replaced",
-		ports.String("id", doc.ID),
+		ports.Uint64("id", doc.ID),
 		ports.Int("geohashes_count", doc.GetGeohashCount()),
 	)
 
 	return nil
 }
 
-// BulkReplace выполняет массовую замену документов через /bulk endpoint
+// internal/adapters/manticore/client.go - исправляем использование AddFailed
 func (c *Client) BulkReplace(ctx context.Context, docs []*domain.Document) (*domain.BatchResult, error) {
 	start := time.Now()
 	result := domain.NewBatchResult()
@@ -247,7 +259,7 @@ func (c *Client) BulkReplace(ctx context.Context, docs []*domain.Document) (*dom
 		ports.Int("batch_size", len(docs)),
 	)
 
-	// Разбиваем на батчи (Manticore может иметь ограничение)
+	// Разбиваем на батчи
 	batches := c.splitIntoBatches(docs, 1000)
 
 	for _, batch := range batches {
@@ -278,45 +290,38 @@ func (c *Client) BulkReplace(ctx context.Context, docs []*domain.Document) (*dom
 	return result, nil
 }
 
-// bulkReplaceBatch выполняет bulk replace для одного батча через /bulk endpoint
+// bulkReplaceBatch исправляем
 func (c *Client) bulkReplaceBatch(ctx context.Context, docs []*domain.Document) (*domain.BatchResult, error) {
 	result := domain.NewBatchResult()
 
-	// Формируем NDJSON для bulk запроса
 	var bulkLines []string
 
 	for _, doc := range docs {
-		// Каждая операция replace в формате NDJSON
-		// { "replace" : { "table" : "table_name", "id" : id, "doc": { ... } } }
 		docMap := doc.ToMap()
-
-		// Конвертируем ID в uint64
-		var idUint uint64
-		if doc.ID != "" {
-			fmt.Sscanf(doc.ID, "%d", &idUint)
-		}
-
-		// Убираем ID из doc, так как он передается отдельно
 		delete(docMap, "id")
 
 		replaceOp := map[string]interface{}{
 			"replace": map[string]interface{}{
-				"index": c.tableName, // В bulk API используется "index", а не "table"
-				"id":    idUint,
+				"index": c.tableName,
+				"id":    doc.ID,
 				"doc":   docMap,
 			},
 		}
 
 		jsonLine, err := json.Marshal(replaceOp)
 		if err != nil {
-			result.AddFailed(doc.ID, fmt.Errorf("failed to marshal: %w", err), domain.ErrorTypeValidation, 1)
+			result.AddFailed(doc.ID, fmt.Errorf("failed to marshal: %w", err),
+				domain.ErrorTypeValidation, 1)
 			continue
 		}
 
 		bulkLines = append(bulkLines, string(jsonLine))
 	}
 
-	// Отправляем bulk запрос
+	if len(bulkLines) == 0 {
+		return result, nil
+	}
+
 	bulkBody := strings.Join(bulkLines, "\n") + "\n"
 
 	bulkResp, _, err := c.apiClient.IndexAPI.Bulk(ctx).Body(bulkBody).Execute()
@@ -324,20 +329,27 @@ func (c *Client) bulkReplaceBatch(ctx context.Context, docs []*domain.Document) 
 		return nil, fmt.Errorf("bulk request failed: %w", err)
 	}
 
-	// Анализируем ответ
 	if bulkResp.Items != nil {
 		for _, item := range bulkResp.Items {
 			if replace, ok := item["replace"]; ok {
-				// Парсим результат операции replace
 				if replaceMap, ok := replace.(map[string]interface{}); ok {
 					if resultStr, ok := replaceMap["result"]; ok {
 						if resultStr == "updated" || resultStr == "created" {
 							result.AddSuccess()
 						} else {
-							// Извлекаем ID
-							var docID string
+							// Извлекаем ID из ответа
+							var docID uint64
 							if id, ok := replaceMap["_id"]; ok {
-								docID = fmt.Sprintf("%v", id)
+								switch v := id.(type) {
+								case float64:
+									docID = uint64(v)
+								case uint64:
+									docID = v
+								}
+							}
+							if docID == 0 && len(docs) > len(result.Errors) {
+								// fallback - используем ID из оригинального документа
+								docID = docs[len(result.Errors)].ID
 							}
 							result.AddFailed(docID,
 								fmt.Errorf("replace failed: %v", resultStr),
@@ -349,7 +361,6 @@ func (c *Client) bulkReplaceBatch(ctx context.Context, docs []*domain.Document) 
 		}
 	}
 
-	// Проверяем общую ошибку
 	if bulkResp.Errors != nil && *bulkResp.Errors {
 		c.logger.Warn("bulk operation had errors",
 			ports.Any("error", bulkResp.Error),
@@ -360,11 +371,9 @@ func (c *Client) bulkReplaceBatch(ctx context.Context, docs []*domain.Document) 
 }
 
 // parseSQLResponse парсит SQL ответ в один документ
-func (c *Client) parseSQLResponse(resp Manticoresearch.SqlResponse, id string) (*domain.Document, error) {
-	// SQL ответ может быть массивом объектов
+func (c *Client) parseSQLResponse(resp Manticoresearch.SqlResponse, id uint64) (*domain.Document, error) {
 	actual := resp.GetActualInstance()
 
-	// Пробуем получить как массив
 	if arr, ok := actual.([]map[string]interface{}); ok {
 		if len(arr) == 0 {
 			return nil, ports.ErrNotFound
@@ -374,59 +383,20 @@ func (c *Client) parseSQLResponse(resp Manticoresearch.SqlResponse, id string) (
 		}
 	}
 
-	// Пробуем получить как объект SqlObjResponse
-	if obj, ok := actual.(Manticoresearch.SqlObjResponse); ok {
-		hits := obj.GetHits()
-		if hits != nil {
-			if hitsArr, ok := hits["hits"].([]interface{}); ok && len(hitsArr) > 0 {
-				if hit, ok := hitsArr[0].(map[string]interface{}); ok {
-					if source, ok := hit["_source"]; ok {
-						if sourceMap, ok := source.(map[string]interface{}); ok {
-							return c.mapToDocument(sourceMap), nil
-						}
-					}
-				}
-			}
-		}
-	}
-
 	return nil, ports.ErrNotFound
 }
 
 // parseSQLResponseArray парсит SQL ответ в мапу документов
-func (c *Client) parseSQLResponseArray(resp Manticoresearch.SqlResponse) (map[string]*domain.Document, error) {
-	result := make(map[string]*domain.Document)
+func (c *Client) parseSQLResponseArray(resp Manticoresearch.SqlResponse) (map[uint64]*domain.Document, error) {
+	result := make(map[uint64]*domain.Document)
 
 	actual := resp.GetActualInstance()
 
-	// Пробуем получить как массив
 	if arr, ok := actual.([]map[string]interface{}); ok {
 		for _, row := range arr {
 			doc := c.mapToDocument(row)
-			if doc != nil && doc.ID != "" {
+			if doc != nil && doc.ID != 0 {
 				result[doc.ID] = doc
-			}
-		}
-		return result, nil
-	}
-
-	// Пробуем получить как объект SqlObjResponse
-	if obj, ok := actual.(Manticoresearch.SqlObjResponse); ok {
-		hits := obj.GetHits()
-		if hits != nil {
-			if hitsArr, ok := hits["hits"].([]interface{}); ok {
-				for _, hitItem := range hitsArr {
-					if hit, ok := hitItem.(map[string]interface{}); ok {
-						if source, ok := hit["_source"]; ok {
-							if sourceMap, ok := source.(map[string]interface{}); ok {
-								doc := c.mapToDocument(sourceMap)
-								if doc != nil && doc.ID != "" {
-									result[doc.ID] = doc
-								}
-							}
-						}
-					}
-				}
 			}
 		}
 	}
@@ -438,9 +408,19 @@ func (c *Client) parseSQLResponseArray(resp Manticoresearch.SqlResponse) (map[st
 func (c *Client) mapToDocument(data map[string]interface{}) *domain.Document {
 	doc := &domain.Document{}
 
-	// ID может быть в разных форматах
-	if id, ok := data["id"]; ok {
-		doc.ID = fmt.Sprintf("%v", id)
+	// ID может быть в разных форматах в ответе SQL
+	if idVal, ok := data["id"]; ok && idVal != nil {
+		switch v := idVal.(type) {
+		case float64:
+			doc.ID = uint64(v)
+		case int64:
+			doc.ID = uint64(v)
+		case uint64:
+			doc.ID = v
+		case string:
+			// Для очень больших ID может приходить строка
+			fmt.Sscanf(v, "%d", &doc.ID)
+		}
 	}
 
 	// Основные поля

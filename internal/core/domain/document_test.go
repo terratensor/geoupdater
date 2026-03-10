@@ -9,35 +9,35 @@ import (
 func TestNewGeoUpdateData(t *testing.T) {
 	tests := []struct {
 		name        string
-		docID       string
+		docID       uint64 // меняем на uint64
 		strings     []string
 		uint64s     []int64
 		expectError bool
 	}{
 		{
 			name:        "valid data",
-			docID:       "123",
+			docID:       123, // убираем кавычки
 			strings:     []string{"abc", "def"},
 			uint64s:     []int64{123, 456},
 			expectError: false,
 		},
 		{
 			name:        "empty doc_id",
-			docID:       "",
+			docID:       0, // 0 считается невалидным
 			strings:     []string{"abc"},
 			uint64s:     []int64{123},
 			expectError: true,
 		},
 		{
 			name:        "count mismatch",
-			docID:       "123",
+			docID:       123,
 			strings:     []string{"abc", "def"},
 			uint64s:     []int64{123},
 			expectError: true,
 		},
 		{
 			name:        "empty string geohash",
-			docID:       "123",
+			docID:       123,
 			strings:     []string{"abc", ""},
 			uint64s:     []int64{123, 456},
 			expectError: true,
@@ -63,13 +63,13 @@ func TestNewGeoUpdateData(t *testing.T) {
 
 func TestDocumentMergeReplace(t *testing.T) {
 	doc := &Document{
-		ID:              "123",
+		ID:              123, // uint64
 		GeohashesString: "abc, def",
 		GeohashesUint64: []int64{123, 456},
 	}
 
 	data := &GeoUpdateData{
-		DocID:           "123",
+		DocID:           123, // uint64
 		GeohashesString: []string{"xyz", "uvw"},
 		GeohashesUint64: []int64{789, 101},
 	}
@@ -93,13 +93,13 @@ func TestDocumentMergeReplace(t *testing.T) {
 
 func TestDocumentMergeMerge(t *testing.T) {
 	doc := &Document{
-		ID:              "123",
+		ID:              123,
 		GeohashesString: "abc, def",
 		GeohashesUint64: []int64{123, 456},
 	}
 
 	data := &GeoUpdateData{
-		DocID:           "123",
+		DocID:           123,
 		GeohashesString: []string{"def", "xyz"}, // def дублируется
 		GeohashesUint64: []int64{456, 789},      // 456 дублируется
 	}

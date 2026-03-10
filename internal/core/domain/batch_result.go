@@ -1,8 +1,9 @@
-// internal/core/domain/batch_result.go
+// internal/core/domain/batch_result.go - исправляем AddFailed
 package domain
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -20,7 +21,7 @@ type BatchResult struct {
 
 // BatchError представляет ошибку при обработке конкретного документа
 type BatchError struct {
-	DocID     string `json:"doc_id"`
+	DocID     string `json:"doc_id"` // храним как строку для совместимости
 	Error     string `json:"error"`
 	ErrorType string `json:"error_type"`
 	Attempts  int    `json:"attempts"`
@@ -40,8 +41,21 @@ func (r *BatchResult) AddSuccess() {
 	r.Total++
 }
 
-// AddFailed добавляет неудачную операцию
-func (r *BatchResult) AddFailed(docID string, err error, errorType ErrorType, attempts int) {
+// AddFailed добавляет неудачную операцию (принимает uint64 ID)
+func (r *BatchResult) AddFailed(docID uint64, err error, errorType ErrorType, attempts int) {
+	r.Failed++
+	r.Total++
+
+	r.Errors = append(r.Errors, BatchError{
+		DocID:     strconv.FormatUint(docID, 10),
+		Error:     err.Error(),
+		ErrorType: string(errorType),
+		Attempts:  attempts,
+	})
+}
+
+// AddFailedWithStringID добавляет неудачную операцию (принимает string ID)
+func (r *BatchResult) AddFailedWithStringID(docID string, err error, errorType ErrorType, attempts int) {
 	r.Failed++
 	r.Total++
 
@@ -54,7 +68,7 @@ func (r *BatchResult) AddFailed(docID string, err error, errorType ErrorType, at
 }
 
 // AddSkipped добавляет пропущенную операцию (документ не найден)
-func (r *BatchResult) AddSkipped(docID string) {
+func (r *BatchResult) AddSkipped(docID uint64) {
 	r.Skipped++
 	r.Total++
 }

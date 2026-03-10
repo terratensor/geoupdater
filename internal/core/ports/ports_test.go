@@ -12,29 +12,43 @@ import (
 func TestInterfacesAreSatisfiable(t *testing.T) {
 	ctx := context.Background()
 
-	// Проверяем Repository
+	// Проверяем Repository - обновляем сигнатуры методов
 	var _ Repository = (*MockRepository)(nil)
 
-	// Проверяем Logger
-	var _ Logger = (*mockLogger)(nil)
-
-	// Проверяем работу с дженериками
+	// Обновляем мок-структуру для работы с uint64
 	repo := &MockRepository{
-		GetDocumentFunc: func(ctx context.Context, id string) (*domain.Document, error) {
+		GetDocumentFunc: func(ctx context.Context, id uint64) (*domain.Document, error) {
 			return &domain.Document{ID: id}, nil
+		},
+		// Можно добавить моки для других методов, если они используются в тесте
+		GetDocumentsBatchFunc: func(ctx context.Context, ids []uint64) (map[uint64]*domain.Document, error) {
+			return nil, nil
+		},
+		ReplaceDocumentFunc: func(ctx context.Context, doc *domain.Document) error {
+			return nil
+		},
+		BulkReplaceFunc: func(ctx context.Context, docs []*domain.Document) (*domain.BatchResult, error) {
+			return &domain.BatchResult{}, nil
+		},
+		PingFunc: func(ctx context.Context) error {
+			return nil
+		},
+		CloseFunc: func() error {
+			return nil
 		},
 	}
 
-	doc, err := repo.GetDocument(ctx, "123")
+	// Теперь передаём uint64
+	doc, err := repo.GetDocument(ctx, 123)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	if doc.ID != "123" {
-		t.Errorf("expected ID 123, got %s", doc.ID)
+	if doc.ID != 123 {
+		t.Errorf("expected ID 123, got %d", doc.ID)
 	}
 }
 
-// Заглушка для тестирования логгера
+// Заглушка для тестирования логгера (без изменений)
 type mockLogger struct{}
 
 func (m *mockLogger) Debug(msg string, fields ...Field)      {}

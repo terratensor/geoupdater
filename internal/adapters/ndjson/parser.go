@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 
 	"github.com/terratensor/geoupdater/internal/core/domain"
@@ -323,16 +324,29 @@ func (p *Parser) readLine(reader *bufio.Reader) ([]byte, error) {
 	return line, nil
 }
 
-// parseLine парсит JSON строку в GeoUpdateData
+// internal/adapters/ndjson/parser.go - исправляем парсинг doc_id
 func (p *Parser) parseLine(line []byte) (*domain.GeoUpdateData, error) {
 	var rawData struct {
-		DocID           string   `json:"doc_id"`
-		GeohashesString []string `json:"geohashes_string"`
-		GeohashesUint64 []int64  `json:"geohashes_uint64"`
+		DocID           interface{} `json:"doc_id"` // может быть строкой или числом
+		GeohashesString []string    `json:"geohashes_string"`
+		GeohashesUint64 []int64     `json:"geohashes_uint64"`
 	}
 
 	if err := json.Unmarshal(line, &rawData); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
+	}
+
+	// Конвертируем DocID в uint64
+	var docID uint64
+	switch v := rawData.DocID.(type) {
+	case float64:
+		docID = uint64(v)
+	case string:
+		docID, _ = strconv.ParseUint(v, 10, 64)
+	case uint64:
+		docID = v
+	default:
+		return nil, fmt.Errorf("invalid doc_id type: %T", rawData.DocID)
 	}
 
 	// Валидация
@@ -344,7 +358,7 @@ func (p *Parser) parseLine(line []byte) (*domain.GeoUpdateData, error) {
 
 	// Создаем доменную модель
 	data, err := domain.NewGeoUpdateData(
-		rawData.DocID,
+		docID,
 		rawData.GeohashesString,
 		rawData.GeohashesUint64,
 	)
@@ -356,14 +370,28 @@ func (p *Parser) parseLine(line []byte) (*domain.GeoUpdateData, error) {
 	return data, nil
 }
 
-// validate проверяет корректность данных
+// internal/adapters/ndjson/parser.go
+// Исправляем метод validate
 func (p *Parser) validate(data *struct {
-	DocID           string   `json:"doc_id"`
-	GeohashesString []string `json:"geohashes_string"`
-	GeohashesUint64 []int64  `json:"geohashes_uint64"`
+	DocID           interface{} `json:"doc_id"` // меняем на interface{}
+	GeohashesString []string    `json:"geohashes_string"`
+	GeohashesUint64 []int64     `json:"geohashes_uint64"`
 }) error {
 
-	if data.DocID == "" {
+	// Конвертируем DocID в строку для проверки
+	var docIDStr string
+	switch v := data.DocID.(type) {
+	case float64:
+		docIDStr = strconv.FormatUint(uint64(v), 10)
+	case string:
+		docIDStr = v
+	case uint64:
+		docIDStr = strconv.FormatUint(v, 10)
+	default:
+		return fmt.Errorf("doc_id has invalid type: %T", data.DocID)
+	}
+
+	if docIDStr == "" {
 		return fmt.Errorf("doc_id is required")
 	}
 

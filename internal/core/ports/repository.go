@@ -10,24 +10,21 @@ import (
 // Repository определяет интерфейс для работы с Manticore Search
 type Repository interface {
 	// GetDocument получает документ по ID
-	// Возвращает domain.ErrNotFound если документ не существует
-	GetDocument(ctx context.Context, id string) (*domain.Document, error)
+	GetDocument(ctx context.Context, id uint64) (*domain.Document, error)
 
 	// GetDocumentsBatch получает пачку документов по списку ID
-	// Возвращает map[id]*domain.Document для найденных документов
-	GetDocumentsBatch(ctx context.Context, ids []string) (map[string]*domain.Document, error)
+	GetDocumentsBatch(ctx context.Context, ids []uint64) (map[uint64]*domain.Document, error)
 
 	// ReplaceDocument заменяет документ полностью
 	ReplaceDocument(ctx context.Context, doc *domain.Document) error
 
 	// BulkReplace выполняет массовую замену документов
-	// Возвращает результаты операции и возможные ошибки
 	BulkReplace(ctx context.Context, docs []*domain.Document) (*domain.BatchResult, error)
 
 	// Ping проверяет соединение с Manticore
 	Ping(ctx context.Context) error
 
-	// Close закрывает соединение с Manticore
+	// Close закрывает соединение
 	Close() error
 }
 

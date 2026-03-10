@@ -37,12 +37,13 @@ func (m *mockMetrics) RecordFileProcessed(filename string, size int, duration ti
 func (m *mockMetrics) RecordManticoreOperation(operation string, duration time.Duration, err error) {}
 func (m *mockMetrics) GetStats(ctx context.Context) (map[string]interface{}, error)                 { return nil, nil }
 
+// internal/adapters/manticore/client_test.go - исправляем TestSplitIntoBatches
 func TestSplitIntoBatches(t *testing.T) {
 	client := &Client{}
 
 	docs := make([]*domain.Document, 2500)
 	for i := 0; i < 2500; i++ {
-		docs[i] = &domain.Document{ID: string(rune(i))}
+		docs[i] = &domain.Document{ID: uint64(i)}
 	}
 
 	batches := client.splitIntoBatches(docs, 1000)

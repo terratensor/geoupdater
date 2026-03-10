@@ -10,7 +10,7 @@ import (
 
 // Document представляет полную запись в библиотеке Manticore
 type Document struct {
-	ID              string  `json:"id"`
+	ID              uint64  `json:"id"` // ID теперь uint64
 	Source          string  `json:"source"`
 	Genre           string  `json:"genre"`
 	Author          string  `json:"author"`
@@ -30,15 +30,15 @@ type Document struct {
 
 // GeoUpdateData представляет данные из NDJSON файла для обновления
 type GeoUpdateData struct {
-	DocID           string   `json:"doc_id"`
+	DocID           uint64   `json:"doc_id"` // DocID теперь uint64
 	GeohashesString []string `json:"geohashes_string"`
 	GeohashesUint64 []int64  `json:"geohashes_uint64"`
 }
 
 // NewGeoUpdateData создает новый экземпляр GeoUpdateData с валидацией
-func NewGeoUpdateData(docID string, geohashesString []string, geohashesUint64 []int64) (*GeoUpdateData, error) {
-	if docID == "" {
-		return nil, fmt.Errorf("doc_id cannot be empty")
+func NewGeoUpdateData(docID uint64, geohashesString []string, geohashesUint64 []int64) (*GeoUpdateData, error) {
+	if docID == 0 {
+		return nil, fmt.Errorf("doc_id cannot be 0")
 	}
 
 	// Проверяем соответствие количества геохешей
@@ -64,7 +64,7 @@ func NewGeoUpdateData(docID string, geohashesString []string, geohashesUint64 []
 // ToMap конвертирует документ в map для Manticore API
 func (d *Document) ToMap() map[string]interface{} {
 	result := map[string]interface{}{
-		"id":               d.ID,
+		"id":               d.ID, // uint64 напрямую
 		"source":           d.Source,
 		"genre":            d.Genre,
 		"author":           d.Author,
@@ -93,8 +93,18 @@ func (d *Document) ToMap() map[string]interface{} {
 func FromMap(data map[string]interface{}) (*Document, error) {
 	doc := &Document{}
 
+	// ID может быть в разных форматах в ответе
 	if id, ok := data["id"]; ok {
-		doc.ID = fmt.Sprintf("%v", id)
+		switch v := id.(type) {
+		case float64:
+			doc.ID = uint64(v)
+		case uint64:
+			doc.ID = v
+		case int64:
+			doc.ID = uint64(v)
+		case string:
+			fmt.Sscanf(v, "%d", &doc.ID)
+		}
 	}
 
 	if source, ok := data["source"]; ok {
@@ -163,7 +173,7 @@ func (d *Document) Merge(data *GeoUpdateData, mode UpdateMode) error {
 	}
 
 	if d.ID != data.DocID {
-		return fmt.Errorf("document ID mismatch: %s != %s", d.ID, data.DocID)
+		return fmt.Errorf("document ID mismatch: %d != %d", d.ID, data.DocID)
 	}
 
 	switch mode {
