@@ -8,6 +8,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/terratensor/geoupdater/internal/adapters/logger"
+	"github.com/terratensor/geoupdater/internal/adapters/ndjson"
 	"github.com/terratensor/geoupdater/internal/core/ports"
 )
 
@@ -106,4 +107,17 @@ func (c *Config) CreateLogger() (ports.Logger, error) {
 	}
 
 	return factory.CreateFromConfig(logCfg)
+}
+
+func (c *Config) CreateParser(logger ports.Logger, metrics ports.MetricsCollector) *ndjson.Parser {
+	parserCfg := &ndjson.Config{
+		BatchSize:   c.BatchSize,
+		Workers:     c.Workers,
+		Validate:    true,
+		SkipErrors:  true,
+		MaxLineSize: 10 * 1024 * 1024, // 10MB
+	}
+
+	factory := ndjson.NewFactory()
+	return factory.Create(parserCfg, logger, metrics)
 }
