@@ -143,15 +143,31 @@ func (c *Client) GetDocument(ctx context.Context, id uint64) (*domain.Document, 
 	return doc, nil
 }
 
-// getDocument внутренний метод для получения документа через SQL
+// Временный код для отладки
 func (c *Client) getDocument(ctx context.Context, id uint64) (*domain.Document, error) {
-	// В SQL запросе ID нужно использовать как есть (uint64)
 	query := fmt.Sprintf("SELECT * FROM %s WHERE id = %d LIMIT 1", c.tableName, id)
 
-	resp, _, err := c.apiClient.UtilsAPI.Sql(ctx).Body(query).RawResponse(false).Execute()
+	// Логируем запрос
+	c.logger.Info("DEBUG: executing query",
+		ports.String("query", query),
+		ports.Uint64("id", id))
+
+	resp, httpResp, err := c.apiClient.UtilsAPI.Sql(ctx).Body(query).RawResponse(false).Execute()
+
+	// Логируем HTTP ответ
+	if httpResp != nil {
+		c.logger.Info("DEBUG: HTTP response",
+			ports.Int("status_code", httpResp.StatusCode),
+			ports.Any("headers", httpResp.Header))
+	}
+
 	if err != nil {
+		c.logger.Error("DEBUG: SQL error", ports.Error(err))
 		return nil, err
 	}
+
+	// Логируем сырой ответ
+	c.logger.Info("DEBUG: raw response", ports.Any("resp", resp))
 
 	return c.parseSQLResponse(*resp, id)
 }
