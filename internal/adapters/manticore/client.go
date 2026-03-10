@@ -17,12 +17,13 @@ import (
 
 // Client реализует ports.Repository для Manticore Search
 type Client struct {
-	apiClient  *Manticoresearch.APIClient
-	config     *Config
-	logger     ports.Logger
-	metrics    ports.MetricsCollector
-	tableName  string
-	httpClient *http.Client
+	apiClient    *Manticoresearch.APIClient
+	config       *Config
+	logger       ports.Logger
+	metrics      ports.MetricsCollector
+	tableName    string
+	httpClient   *http.Client
+	searchClient *SearchClient // новый поисковый клиент
 }
 
 // Config конфигурация Manticore клиента
@@ -55,12 +56,10 @@ func NewClient(cfg *Config, logger ports.Logger, metrics ports.MetricsCollector)
 		cfg = DefaultConfig()
 	}
 
-	// Создаем HTTP клиент с таймаутом
 	httpClient := &http.Client{
 		Timeout: cfg.Timeout,
 	}
 
-	// Создаем конфигурацию для Manticore клиента
 	configuration := Manticoresearch.NewConfiguration()
 	configuration.HTTPClient = httpClient
 	configuration.Servers[0].URL = fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
@@ -77,6 +76,9 @@ func NewClient(cfg *Config, logger ports.Logger, metrics ports.MetricsCollector)
 		httpClient: httpClient,
 	}
 
+	// Создаем поисковый клиент
+	client.searchClient = NewSearchClient(apiClient, cfg.TableName, logger, metrics)
+
 	// Проверяем соединение
 	if err := client.Ping(context.Background()); err != nil {
 		return nil, fmt.Errorf("failed to connect to Manticore: %w", err)
@@ -92,7 +94,17 @@ func NewClient(cfg *Config, logger ports.Logger, metrics ports.MetricsCollector)
 	return client, nil
 }
 
-// Ping проверяет соединение с Manticore через SQL запрос
+// GetDocument получает документ по ID через JSON Search API
+func (c *Client) GetDocument(ctx context.Context, id uint64) (*domain.Document, error) {
+	return c.searchClient.SearchByID(ctx, id)
+}
+
+// GetDocumentsBatch получает пачку документов по списку ID через JSON Search API
+func (c *Client) GetDocumentsBatch(ctx context.Context, ids []uint64) (map[uint64]*domain.Document, error) {
+	return c.searchClient.SearchByIDs(ctx, ids)
+}
+
+// Ping проверяет соединение с Manticore
 func (c *Client) Ping(ctx context.Context) error {
 	start := time.Now()
 	defer func() {
@@ -107,7 +119,6 @@ func (c *Client) Ping(ctx context.Context) error {
 		return fmt.Errorf("ping failed: %w", err)
 	}
 
-	// Проверяем что ответ корректен
 	if resp == nil {
 		return fmt.Errorf("empty response from Manticore")
 	}
@@ -136,14 +147,11 @@ func (c *Client) ReplaceDocument(ctx context.Context, doc *domain.Document) erro
 
 // replaceDocument внутренний метод для замены документа через JSON REPLACE
 func (c *Client) replaceDocument(ctx context.Context, doc *domain.Document) error {
-	// Создаем запрос на replace через JSON API
 	docMap := doc.ToMap()
-
-	// Для JSON API ID должен быть в поле id верхнего уровня, не в doc
-	delete(docMap, "id") // убираем id из doc
+	delete(docMap, "id")
 
 	replaceRequest := Manticoresearch.NewInsertDocumentRequest(c.tableName, docMap)
-	replaceRequest.SetId(doc.ID) // ID передаем отдельно как uint64
+	replaceRequest.SetId(doc.ID)
 
 	_, _, err := c.apiClient.IndexAPI.Replace(ctx).InsertDocumentRequest(*replaceRequest).Execute()
 	if err != nil {
@@ -158,7 +166,7 @@ func (c *Client) replaceDocument(ctx context.Context, doc *domain.Document) erro
 	return nil
 }
 
-// internal/adapters/manticore/client.go - исправляем использование AddFailed
+// BulkReplace выполняет массовую замену документов через /bulk endpoint
 func (c *Client) BulkReplace(ctx context.Context, docs []*domain.Document) (*domain.BatchResult, error) {
 	start := time.Now()
 	result := domain.NewBatchResult()
@@ -171,7 +179,6 @@ func (c *Client) BulkReplace(ctx context.Context, docs []*domain.Document) (*dom
 		ports.Int("batch_size", len(docs)),
 	)
 
-	// Разбиваем на батчи
 	batches := c.splitIntoBatches(docs, 1000)
 
 	for _, batch := range batches {
@@ -181,7 +188,6 @@ func (c *Client) BulkReplace(ctx context.Context, docs []*domain.Document) (*dom
 				ports.Int("batch_size", len(batch)),
 				ports.Error(err),
 			)
-			// Добавляем все документы как failed
 			for _, doc := range batch {
 				result.AddFailed(doc.ID, err, domain.ErrorTypeManticore, 1)
 			}
@@ -202,7 +208,7 @@ func (c *Client) BulkReplace(ctx context.Context, docs []*domain.Document) (*dom
 	return result, nil
 }
 
-// bulkReplaceBatch исправляем
+// bulkReplaceBatch выполняет bulk replace для одного батча
 func (c *Client) bulkReplaceBatch(ctx context.Context, docs []*domain.Document) (*domain.BatchResult, error) {
 	result := domain.NewBatchResult()
 
@@ -282,7 +288,7 @@ func (c *Client) bulkReplaceBatch(ctx context.Context, docs []*domain.Document) 
 	return result, nil
 }
 
-// splitIntoBatches разбивает слайс документов на батчи указанного размера
+// splitIntoBatches разбивает слайс документов на батчи
 func (c *Client) splitIntoBatches(docs []*domain.Document, batchSize int) [][]*domain.Document {
 	var batches [][]*domain.Document
 
