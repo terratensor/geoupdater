@@ -136,7 +136,7 @@ func TestClientIntegration(t *testing.T) {
 		updateData := &domain.GeoUpdateData{
 			DocID:           testID,
 			GeohashesString: []string{"test1", "test2", "test3"},
-			GeohashesUint64: []int64{111111, 222222, 333333},
+			GeohashesUint64: []uint64{111111, 222222, 333333},
 		}
 
 		// Сохраняем оригинальные значения для восстановления
@@ -199,7 +199,7 @@ func TestClientIntegration(t *testing.T) {
 			updateData := &domain.GeoUpdateData{
 				DocID:           id,
 				GeohashesString: []string{fmt.Sprintf("bulk_test_%d", id)},
-				GeohashesUint64: []int64{int64(time.Now().UnixNano())},
+				GeohashesUint64: []uint64{uint64(time.Now().UnixNano())},
 			}
 
 			doc.Merge(updateData, domain.ModeMerge)
@@ -334,7 +334,7 @@ func BenchmarkBulkReplace(b *testing.B) {
 			Title:           fmt.Sprintf("Test Document %d", i),
 			Content:         "Test content for benchmark",
 			GeohashesString: "test1, test2, test3",
-			GeohashesUint64: []int64{1, 2, 3},
+			GeohashesUint64: []uint64{1, 2, 3},
 		}
 	}
 

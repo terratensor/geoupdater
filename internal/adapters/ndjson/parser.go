@@ -357,11 +357,12 @@ func (p *Parser) parseLine(line []byte) (*domain.GeoUpdateData, error) {
 	}
 
 	// Создаем доменную модель
-	data, err := domain.NewGeoUpdateData(
-		docID,
-		rawData.GeohashesString,
-		rawData.GeohashesUint64,
-	)
+	uint64Geohashes := make([]uint64, len(rawData.GeohashesUint64))
+	for i, v := range rawData.GeohashesUint64 {
+		uint64Geohashes[i] = uint64(v)
+	}
+
+	data, err := domain.NewGeoUpdateData(docID, rawData.GeohashesString, uint64Geohashes)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to create GeoUpdateData: %w", err)
