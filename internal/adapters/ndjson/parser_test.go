@@ -1,4 +1,4 @@
-// internal/adapters/ndjson/parser_test.go
+// internal/adapters/ndjson/parser_test.go - исправленная версия
 package ndjson
 
 import (
@@ -199,7 +199,8 @@ invalid json line
 		count++
 	}
 
-	if count != 1 { // Должна быть только первая запись
+	// Должна быть только первая запись, потом ошибка
+	if count != 1 {
 		t.Errorf("expected 1 record with SkipErrors=false, got %d", count)
 	}
 
