@@ -12,7 +12,6 @@ import (
 	"github.com/terratensor/geoupdater/internal/core/ports"
 )
 
-// TestClientIntegration реальные тесты с Manticore
 func TestClientIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
@@ -31,7 +30,9 @@ func TestClientIntegration(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Host = "localhost"
 	cfg.Port = 9308
-	cfg.TableName = "library2026" // Используем реальную таблицу
+	cfg.TableName = "library2026"
+	cfg.Timeout = 30 * time.Second
+	cfg.BatchSize = 1000
 
 	metrics := &mockMetrics{}
 
@@ -41,20 +42,24 @@ func TestClientIntegration(t *testing.T) {
 	}
 	defer client.Close()
 
+	ctx := context.Background()
+
+	// Тест 1: Проверка соединения
 	t.Run("Ping", func(t *testing.T) {
-		err := client.Ping(context.Background())
+		err := client.Ping(ctx)
 		if err != nil {
 			t.Errorf("Ping failed: %v", err)
 		}
 	})
 
+	// Тест 2: Поиск одного документа
 	t.Run("GetDocument", func(t *testing.T) {
-		testID := uint64(6056452479959171091) // теперь uint64
+		testID := uint64(6056452479959171091)
 
-		doc, err := client.GetDocument(context.Background(), testID)
+		doc, err := client.GetDocument(ctx, testID)
 		if err != nil {
 			if err == ports.ErrNotFound {
-				t.Logf("Document %d not found", testID)
+				t.Logf("Document %d not found, skipping test", testID)
 				return
 			}
 			t.Fatalf("GetDocument failed: %v", err)
@@ -63,10 +68,11 @@ func TestClientIntegration(t *testing.T) {
 		t.Logf("Retrieved document: ID=%d, Title=%s", doc.ID, doc.Title)
 
 		if doc.ID != testID {
-			t.Errorf("Expected ID %d, got %d", testID, doc.ID)
+			t.Errorf("ID mismatch: got %d, want %d", doc.ID, testID)
 		}
 	})
 
+	// Тест 3: Пакетный поиск документов
 	t.Run("GetDocumentsBatch", func(t *testing.T) {
 		ids := []uint64{
 			6056452479959171091,
@@ -74,7 +80,7 @@ func TestClientIntegration(t *testing.T) {
 			6056452479959171104,
 		}
 
-		docs, err := client.GetDocumentsBatch(context.Background(), ids)
+		docs, err := client.GetDocumentsBatch(ctx, ids)
 		if err != nil {
 			t.Fatalf("GetDocumentsBatch failed: %v", err)
 		}
@@ -83,13 +89,42 @@ func TestClientIntegration(t *testing.T) {
 		for id, doc := range docs {
 			t.Logf("  - %d: %s", id, doc.Title)
 		}
+
+		// Проверяем что все ID найдены
+		for _, id := range ids {
+			if _, ok := docs[id]; !ok {
+				t.Errorf("Document %d not found", id)
+			}
+		}
 	})
 
+	// Тест 4: Пакетный поиск с большим количеством ID
+	t.Run("GetDocumentsBatch Large", func(t *testing.T) {
+		// Создаем 2500 ID для теста (3 батча по 1000)
+		ids := make([]uint64, 2500)
+		for i := 0; i < 2500; i++ {
+			ids[i] = uint64(6056452479959171000 + uint64(i))
+		}
+
+		start := time.Now()
+		docs, err := client.GetDocumentsBatch(ctx, ids)
+		duration := time.Since(start)
+
+		if err != nil {
+			t.Fatalf("GetDocumentsBatch large failed: %v", err)
+		}
+
+		t.Logf("Retrieved %d documents from %d requested in %v",
+			len(docs), len(ids), duration)
+		t.Logf("Average per document: %v", duration/time.Duration(len(ids)))
+	})
+
+	// Тест 5: Замена документа
 	t.Run("ReplaceDocument", func(t *testing.T) {
 		// Сначала получаем существующий документ
 		testID := uint64(6056452479959171091)
 
-		existing, err := client.GetDocument(context.Background(), testID)
+		existing, err := client.GetDocument(ctx, testID)
 		if err != nil {
 			if err == ports.ErrNotFound {
 				t.Skipf("Document %d not found, skipping replace test", testID)
@@ -115,36 +150,37 @@ func TestClientIntegration(t *testing.T) {
 		}
 
 		// Сохраняем в Manticore
-		err = client.ReplaceDocument(context.Background(), existing)
+		err = client.ReplaceDocument(ctx, existing)
 		if err != nil {
 			t.Fatalf("ReplaceDocument failed: %v", err)
 		}
 
 		// Проверяем что сохранилось
-		updated, err := client.GetDocument(context.Background(), testID)
+		updated, err := client.GetDocument(ctx, testID)
 		if err != nil {
 			t.Fatalf("Failed to get updated document: %v", err)
 		}
 
-		t.Logf("Updated document: %s", updated.GeohashesString)
+		t.Logf("Updated document geohashes: %s", updated.GeohashesString)
 
 		// Восстанавливаем оригинальные значения
 		existing.GeohashesString = originalStrings
 		existing.GeohashesUint64 = originalUint64
-		err = client.ReplaceDocument(context.Background(), existing)
+		err = client.ReplaceDocument(ctx, existing)
 		if err != nil {
 			t.Errorf("Failed to restore original document: %v", err)
 		}
 	})
 
+	// Тест 6: Массовая замена документов
 	t.Run("BulkReplace", func(t *testing.T) {
 		// Получаем несколько документов для теста
 		ids := []uint64{
-			uint64(6056452479959171091),
-			uint64(6056452479959171088),
+			6056452479959171091,
+			6056452479959171088,
 		}
 
-		existingDocs, err := client.GetDocumentsBatch(context.Background(), ids)
+		existingDocs, err := client.GetDocumentsBatch(ctx, ids)
 		if err != nil {
 			t.Fatalf("Failed to get documents: %v", err)
 		}
@@ -155,13 +191,11 @@ func TestClientIntegration(t *testing.T) {
 
 		// Подготавливаем документы для обновления
 		var docsToUpdate []*domain.Document
-		originalValues := make(map[uint64]string) // для восстановления
+		originalValues := make(map[uint64]string)
 
 		for id, doc := range existingDocs {
-			// Сохраняем оригинал
 			originalValues[id] = doc.GeohashesString
 
-			// Создаем тестовые данные
 			updateData := &domain.GeoUpdateData{
 				DocID:           id,
 				GeohashesString: []string{fmt.Sprintf("bulk_test_%d", id)},
@@ -173,7 +207,7 @@ func TestClientIntegration(t *testing.T) {
 		}
 
 		// Выполняем bulk replace
-		result, err := client.BulkReplace(context.Background(), docsToUpdate)
+		result, err := client.BulkReplace(ctx, docsToUpdate)
 		if err != nil {
 			t.Fatalf("BulkReplace failed: %v", err)
 		}
@@ -182,7 +216,7 @@ func TestClientIntegration(t *testing.T) {
 
 		// Проверяем что обновилось
 		for id := range existingDocs {
-			updated, err := client.GetDocument(context.Background(), id)
+			updated, err := client.GetDocument(ctx, id)
 			if err != nil {
 				t.Errorf("Failed to get document %d after bulk: %v", id, err)
 				continue
@@ -197,14 +231,14 @@ func TestClientIntegration(t *testing.T) {
 			restoreDocs = append(restoreDocs, doc)
 		}
 
-		_, err = client.BulkReplace(context.Background(), restoreDocs)
+		_, err = client.BulkReplace(ctx, restoreDocs)
 		if err != nil {
 			t.Errorf("Failed to restore documents: %v", err)
 		}
 	})
 }
 
-// BenchmarkGetDocument бенчмарк для получения документа
+// Бенчмарки для измерения производительности
 func BenchmarkGetDocument(b *testing.B) {
 	logCfg := logger.DefaultConfig()
 	logCfg.Console = false
@@ -213,6 +247,7 @@ func BenchmarkGetDocument(b *testing.B) {
 	cfg := DefaultConfig()
 	cfg.Host = "localhost"
 	cfg.Port = 9308
+	cfg.TableName = "library2026"
 
 	metrics := &mockMetrics{}
 
@@ -234,7 +269,42 @@ func BenchmarkGetDocument(b *testing.B) {
 	}
 }
 
-// BenchmarkBulkReplace бенчмарк для bulk операций
+func BenchmarkGetDocumentsBatch(b *testing.B) {
+	logCfg := logger.DefaultConfig()
+	logCfg.Console = false
+	log, _ := logger.NewZapLogger(logCfg)
+
+	cfg := DefaultConfig()
+	cfg.Host = "localhost"
+	cfg.Port = 9308
+	cfg.TableName = "library2026"
+	cfg.BatchSize = 1000
+
+	metrics := &mockMetrics{}
+
+	client, err := NewClient(cfg, log, metrics)
+	if err != nil {
+		b.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	// Подготавливаем 100 ID для теста
+	ids := make([]uint64, 100)
+	for i := 0; i < 100; i++ {
+		ids[i] = uint64(6056452479959171000 + uint64(i))
+	}
+
+	ctx := context.Background()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_, err := client.GetDocumentsBatch(ctx, ids)
+		if err != nil {
+			b.Fatalf("GetDocumentsBatch failed: %v", err)
+		}
+	}
+}
+
 func BenchmarkBulkReplace(b *testing.B) {
 	logCfg := logger.DefaultConfig()
 	logCfg.Console = false
@@ -243,6 +313,7 @@ func BenchmarkBulkReplace(b *testing.B) {
 	cfg := DefaultConfig()
 	cfg.Host = "localhost"
 	cfg.Port = 9308
+	cfg.TableName = "library2026"
 
 	metrics := &mockMetrics{}
 
@@ -256,8 +327,12 @@ func BenchmarkBulkReplace(b *testing.B) {
 	docs := make([]*domain.Document, 100)
 	for i := 0; i < 100; i++ {
 		docs[i] = &domain.Document{
-			ID:              uint64(i + 1000000), // uint64, не строка
+			ID:              uint64(9000000000000000000 + uint64(i)),
 			Source:          "benchmark",
+			Genre:           "test",
+			Author:          "benchmark",
+			Title:           fmt.Sprintf("Test Document %d", i),
+			Content:         "Test content for benchmark",
 			GeohashesString: "test1, test2, test3",
 			GeohashesUint64: []int64{1, 2, 3},
 		}

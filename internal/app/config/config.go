@@ -1,8 +1,8 @@
-// internal/app/config/config.go
+// internal/app/config/config.go - обновляем с учетом поисковых параметров
 package config
 
 import (
-	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -22,9 +22,13 @@ type Config struct {
 	ManticoreTimeout  time.Duration `envconfig:"MANTICORE_TIMEOUT" default:"30s"`
 	ManticoreMaxConns int           `envconfig:"MANTICORE_MAX_CONNS" default:"10"`
 
+	// Search configuration
+	SearchBatchSize  int `envconfig:"SEARCH_BATCH_SIZE" default:"1000"`  // размер батча для поиска
+	SearchMaxMatches int `envconfig:"SEARCH_MAX_MATCHES" default:"1000"` // max_matches для поиска
+
 	// Update configuration
 	UpdateMode string        `envconfig:"UPDATE_MODE" default:"merge"` // replace or merge
-	BatchSize  int           `envconfig:"BATCH_SIZE" default:"1000"`
+	BatchSize  int           `envconfig:"BATCH_SIZE" default:"1000"`   // размер батча для replace
 	Workers    int           `envconfig:"WORKERS" default:"5"`
 	MaxRetries int           `envconfig:"MAX_RETRIES" default:"3"`
 	RetryDelay time.Duration `envconfig:"RETRY_DELAY" default:"1s"`
@@ -46,7 +50,6 @@ type Config struct {
 
 // Load загружает конфигурацию из переменных окружения и .env файла
 func Load() (*Config, error) {
-	// Загружаем .env файл если он существует
 	_ = godotenv.Load()
 
 	var cfg Config
@@ -55,7 +58,6 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	// Валидация конфигурации
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -84,6 +86,17 @@ func (c *Config) Validate() error {
 		c.BatchSize = 1000
 	}
 
+	if c.SearchBatchSize <= 0 {
+		log.Println("warning: invalid SEARCH_BATCH_SIZE, using default 1000")
+		c.SearchBatchSize = 1000
+	}
+
+	if c.SearchMaxMatches < c.SearchBatchSize {
+		log.Printf("warning: SEARCH_MAX_MATCHES (%d) < SEARCH_BATCH_SIZE (%d), adjusting to %d",
+			c.SearchMaxMatches, c.SearchBatchSize, c.SearchBatchSize)
+		c.SearchMaxMatches = c.SearchBatchSize
+	}
+
 	if c.Workers <= 0 {
 		log.Println("warning: invalid WORKERS, using default 5")
 		c.Workers = 5
@@ -94,34 +107,7 @@ func (c *Config) Validate() error {
 
 // ManticoreURL возвращает полный URL для подключения к Manticore
 func (c *Config) ManticoreURL() string {
-	return "http://" + c.ManticoreHost + ":" + string(rune(c.ManticorePort))
-}
-
-func (c *Config) CreateLogger() (ports.Logger, error) {
-	factory := logger.NewFactory()
-
-	logCfg := &logger.Config{
-		Level:      c.LogLevel,
-		OutputPath: c.LogFile,
-		FileOutput: c.LogFile != "",
-		Console:    true,
-		AddSource:  true,
-	}
-
-	return factory.CreateFromConfig(logCfg)
-}
-
-func (c *Config) CreateParser(logger ports.Logger, metrics ports.MetricsCollector) *ndjson.Parser {
-	parserCfg := &ndjson.Config{
-		BatchSize:   c.BatchSize,
-		Workers:     c.Workers,
-		Validate:    true,
-		SkipErrors:  true,
-		MaxLineSize: 10 * 1024 * 1024, // 10MB
-	}
-
-	factory := ndjson.NewFactory()
-	return factory.Create(parserCfg, logger, metrics)
+	return fmt.Sprintf("http://%s:%d", c.ManticoreHost, c.ManticorePort)
 }
 
 // CreateManticoreClient создает Manticore клиент из конфигурации
@@ -134,8 +120,36 @@ func (c *Config) CreateManticoreClient(logger ports.Logger, metrics ports.Metric
 		MaxConns:   c.ManticoreMaxConns,
 		RetryCount: c.MaxRetries,
 		RetryDelay: c.RetryDelay,
+		BatchSize:  c.SearchBatchSize, // передаем размер батча для поиска
 	}
 
-	factory := manticore.NewFactory()
-	return factory.Create(context.Background(), manticoreCfg, logger, metrics)
+	return manticore.NewClient(manticoreCfg, logger, metrics)
+}
+
+// CreateLogger создает логгер из конфигурации
+func (c *Config) CreateLogger() (ports.Logger, error) {
+	logCfg := &logger.Config{
+		Level:      c.LogLevel,
+		OutputPath: c.LogFile,
+		FileOutput: c.LogFile != "",
+		Console:    true,
+		AddSource:  true,
+	}
+
+	factory := logger.NewFactory()
+	return factory.CreateFromConfig(logCfg)
+}
+
+// CreateParser создает парсер из конфигурации
+func (c *Config) CreateParser(logger ports.Logger, metrics ports.MetricsCollector) *ndjson.Parser {
+	parserCfg := &ndjson.Config{
+		BatchSize:   c.BatchSize,
+		Workers:     c.Workers,
+		Validate:    true,
+		SkipErrors:  true,
+		MaxLineSize: 10 * 1024 * 1024,
+	}
+
+	factory := ndjson.NewFactory()
+	return factory.Create(parserCfg, logger, metrics)
 }

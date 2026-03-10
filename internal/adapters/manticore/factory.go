@@ -1,4 +1,4 @@
-// internal/adapters/manticore/factory.go
+// internal/adapters/manticore/factory.go - обновляем с учетом новых параметров
 package manticore
 
 import (
@@ -25,10 +25,15 @@ func (f *Factory) Create(ctx context.Context, cfg *Config, logger ports.Logger, 
 	return NewClient(cfg, logger, metrics)
 }
 
-// CreateWithTable создает клиент для конкретной таблицы
-func (f *Factory) CreateWithTable(ctx context.Context, tableName string, logger ports.Logger, metrics ports.MetricsCollector) (*Client, error) {
+// CreateWithConfig создает клиент с переданной конфигурацией
+func (f *Factory) CreateWithConfig(ctx context.Context, cfg *Config, logger ports.Logger, metrics ports.MetricsCollector) (*Client, error) {
+	return NewClient(cfg, logger, metrics)
+}
+
+// CreateWithBatchSize создает клиент с определенным размером батча
+func (f *Factory) CreateWithBatchSize(ctx context.Context, batchSize int, logger ports.Logger, metrics ports.MetricsCollector) (*Client, error) {
 	cfg := DefaultConfig()
-	cfg.TableName = tableName
+	cfg.BatchSize = batchSize
 	return NewClient(cfg, logger, metrics)
 }
 
