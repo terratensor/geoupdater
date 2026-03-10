@@ -7,6 +7,8 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/kelseyhightower/envconfig"
+	"github.com/terratensor/geoupdater/internal/adapters/logger"
+	"github.com/terratensor/geoupdater/internal/core/ports"
 )
 
 type Config struct {
@@ -90,4 +92,18 @@ func (c *Config) Validate() error {
 // ManticoreURL возвращает полный URL для подключения к Manticore
 func (c *Config) ManticoreURL() string {
 	return "http://" + c.ManticoreHost + ":" + string(rune(c.ManticorePort))
+}
+
+func (c *Config) CreateLogger() (ports.Logger, error) {
+	factory := logger.NewFactory()
+
+	logCfg := &logger.Config{
+		Level:      c.LogLevel,
+		OutputPath: c.LogFile,
+		FileOutput: c.LogFile != "",
+		Console:    true,
+		AddSource:  true,
+	}
+
+	return factory.CreateFromConfig(logCfg)
 }
