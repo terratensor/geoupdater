@@ -28,7 +28,7 @@ logs/
 
 # Data
 data/
-failed/
+failed/logs
 *.ndjson
 
 # Environment
