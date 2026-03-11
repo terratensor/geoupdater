@@ -204,6 +204,16 @@ func (d *Document) ToMap() map[string]interface{} {
 	return result
 }
 
+// Validate проверяет корректность режима обновления
+func (m UpdateMode) Validate() error {
+	switch m {
+	case ModeReplace, ModeMerge:
+		return nil
+	default:
+		return fmt.Errorf("invalid update mode: %s", m)
+	}
+}
+
 // Merge объединяет данные из GeoUpdateData
 func (d *Document) Merge(data *GeoUpdateData, mode UpdateMode) error {
 	if data == nil {
