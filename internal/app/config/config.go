@@ -8,6 +8,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/kelseyhightower/envconfig"
+	"github.com/terratensor/geoupdater/internal/adapters/failed"
 	"github.com/terratensor/geoupdater/internal/adapters/logger"
 	"github.com/terratensor/geoupdater/internal/adapters/manticore"
 	"github.com/terratensor/geoupdater/internal/adapters/ndjson"
@@ -152,4 +153,19 @@ func (c *Config) CreateParser(logger ports.Logger, metrics ports.MetricsCollecto
 
 	factory := ndjson.NewFactory()
 	return factory.Create(parserCfg, logger, metrics)
+}
+
+// CreateFailedRepository создает репозиторий для failed записей
+func (c *Config) CreateFailedRepository(logger ports.Logger, metrics ports.MetricsCollector) (*failed.FileRepository, error) {
+	failedCfg := &failed.Config{
+		FailedDir:      c.FailedDir,
+		FilePrefix:     "failed",
+		MaxFileSize:    100 * 1024 * 1024, // 100MB
+		MaxAge:         7 * 24 * time.Hour,
+		FlushInterval:  5 * time.Second,
+		RotateInterval: 24 * time.Hour,
+	}
+
+	factory := failed.NewFactory()
+	return factory.Create(failedCfg, logger, metrics)
 }
