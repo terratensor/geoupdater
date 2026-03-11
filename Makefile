@@ -38,3 +38,16 @@ docker-run:
 example:
 	@echo "Running example..."
 	go run cmd/geoupdater/main.go -dir ./data -pattern "*.ndjson" -mode merge
+
+.PHONY: test-file
+test-file: build
+	@echo "=== Тестирование на файле results.ndjson ==="
+	@./scripts/prepare_test.sh
+	@time ./build/geoupdater -dir ./data -mode merge
+	@echo "\n=== Статистика после обработки ==="
+	@./build/geoupdater -stats
+
+.PHONY: test-reprocess
+test-reprocess: build
+	@echo "=== Репроцессинг failed записей ==="
+	@./build/geoupdater -reprocess

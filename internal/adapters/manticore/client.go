@@ -240,15 +240,16 @@ func (c *Client) bulkReplaceBatch(ctx context.Context, docs []*domain.Document) 
 	// Анализируем ответ
 	if bulkResp.Items != nil {
 		for _, item := range bulkResp.Items {
-			if replace, ok := item["replace"]; ok {
-				if replaceMap, ok := replace.(map[string]interface{}); ok {
-					if resultStr, ok := replaceMap["result"]; ok {
+			// В ответе ключ "bulk", а не "replace"
+			if bulk, ok := item["bulk"]; ok {
+				if bulkMap, ok := bulk.(map[string]interface{}); ok {
+					if resultStr, ok := bulkMap["result"]; ok {
 						if resultStr == "updated" || resultStr == "created" {
 							result.AddSuccess()
 						} else {
 							// Извлекаем ID из ответа
 							var docID uint64
-							if id, ok := replaceMap["_id"]; ok {
+							if id, ok := bulkMap["_id"]; ok {
 								switch v := id.(type) {
 								case float64:
 									docID = uint64(v)

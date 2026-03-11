@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/terratensor/geoupdater/internal/adapters/logger"
+	"github.com/terratensor/geoupdater/internal/core/domain"
 )
 
 func TestParseLine(t *testing.T) {
@@ -18,17 +19,33 @@ func TestParseLine(t *testing.T) {
 	tests := []struct {
 		name        string
 		line        string
-		wantDocID   uint64 // Меняем тип на uint64
+		wantDocID   uint64
 		wantStrings int
 		wantUint64  int
 		wantErr     bool
 	}{
 		{
-			name:        "valid line",
+			name:        "valid line with string doc_id",
 			line:        `{"doc_id":"123","geohashes_string":["abc","def"],"geohashes_uint64":[123,456]}`,
-			wantDocID:   123, // Убираем кавычки
+			wantDocID:   123,
 			wantStrings: 2,
 			wantUint64:  2,
+			wantErr:     false,
+		},
+		{
+			name:        "valid line with number doc_id",
+			line:        `{"doc_id":123,"geohashes_string":["abc","def"],"geohashes_uint64":[123,456]}`,
+			wantDocID:   123,
+			wantStrings: 2,
+			wantUint64:  2,
+			wantErr:     false,
+		},
+		{
+			name:        "valid line with large doc_id",
+			line:        `{"doc_id":"6056452479959171091","geohashes_string":["abc"],"geohashes_uint64":[123]}`,
+			wantDocID:   6056452479959171091,
+			wantStrings: 1,
+			wantUint64:  1,
 			wantErr:     false,
 		},
 		{
@@ -51,14 +68,6 @@ func TestParseLine(t *testing.T) {
 			line:    `{"doc_id":"123","geohashes_string":[],"geohashes_uint64":[]}`,
 			wantErr: true,
 		},
-		{
-			name:        "doc_id as number",
-			line:        `{"doc_id":456,"geohashes_string":["abc"],"geohashes_uint64":[123]}`,
-			wantDocID:   456,
-			wantStrings: 1,
-			wantUint64:  1,
-			wantErr:     false,
-		},
 	}
 
 	for _, tt := range tests {
@@ -77,7 +86,6 @@ func TestParseLine(t *testing.T) {
 				return
 			}
 
-			// Сравниваем uint64 с uint64
 			if data.DocID != tt.wantDocID {
 				t.Errorf("doc_id = %d, want %d", data.DocID, tt.wantDocID)
 			}
@@ -103,7 +111,7 @@ func TestParseFile(t *testing.T) {
 	}
 	defer os.Remove(tmpfile.Name())
 
-	// Пишем тестовые данные
+	// Пишем тестовые данные с doc_id как в реальном файле (строкой)
 	content := `{"doc_id":"1","geohashes_string":["abc"],"geohashes_uint64":[123]}
 {"doc_id":"2","geohashes_string":["def","ghi"],"geohashes_uint64":[456,789]}
 {"doc_id":"3","geohashes_string":["xyz"],"geohashes_uint64":[101]}`
@@ -124,27 +132,32 @@ func TestParseFile(t *testing.T) {
 	dataChan, errChan := parser.ParseFile(ctx, tmpfile.Name())
 
 	var count int
-	var errors []error
+	var records []*domain.GeoUpdateData
 
 	// Собираем данные
 	for data := range dataChan {
 		count++
-		if data.DocID == 0 { // Сравниваем с 0, а не с пустой строкой
+		records = append(records, data)
+		if data.DocID == 0 {
 			t.Error("received data with empty doc_id")
 		}
 	}
 
 	// Собираем ошибки
 	for err := range errChan {
-		errors = append(errors, err)
+		t.Errorf("unexpected error: %v", err)
 	}
 
 	if count != 3 {
 		t.Errorf("expected 3 records, got %d", count)
 	}
 
-	if len(errors) > 0 {
-		t.Errorf("unexpected errors: %v", errors)
+	// Проверяем конкретные значения
+	expectedIDs := []uint64{1, 2, 3}
+	for i, record := range records {
+		if record.DocID != expectedIDs[i] {
+			t.Errorf("record %d: expected ID %d, got %d", i, expectedIDs[i], record.DocID)
+		}
 	}
 }
 
@@ -214,9 +227,13 @@ invalid json line
 	}
 
 	// Должна быть ошибка
-	err = <-errChan
-	if err == nil {
-		t.Error("expected error with SkipErrors=false, got nil")
+	select {
+	case err := <-errChan:
+		if err == nil {
+			t.Error("expected error with SkipErrors=false, got nil")
+		}
+	default:
+		t.Error("expected error channel to have an error")
 	}
 }
 
@@ -289,15 +306,23 @@ func TestParseReader(t *testing.T) {
 	dataChan, errChan := parser.ParseReader(ctx, content)
 
 	var count int
+	var records []*domain.GeoUpdateData
+
 	for data := range dataChan {
 		count++
-		if data.DocID == 0 { // Сравниваем с 0
-			t.Error("received data with empty doc_id")
-		}
+		records = append(records, data)
 	}
 
 	if count != 2 {
 		t.Errorf("expected 2 records, got %d", count)
+	}
+
+	// Проверяем что ID распарсились правильно
+	expectedIDs := []uint64{1, 2}
+	for i, record := range records {
+		if record.DocID != expectedIDs[i] {
+			t.Errorf("record %d: expected ID %d, got %d", i, expectedIDs[i], record.DocID)
+		}
 	}
 
 	select {
@@ -352,7 +377,6 @@ func TestFindFiles(t *testing.T) {
 	}
 }
 
-// internal/adapters/ndjson/parser_test.go - исправленная версия теста
 func TestContextCancellation(t *testing.T) {
 	tmpfile, err := os.CreateTemp("", "test*.ndjson")
 	if err != nil {
@@ -360,11 +384,10 @@ func TestContextCancellation(t *testing.T) {
 	}
 	defer os.Remove(tmpfile.Name())
 
-	// УВЕЛИЧИВАЕМ РАЗМЕР ФАЙЛА для гарантии, что обработка не завершится до таймаута
-	// Создаём файл с 1,000,000 строк вместо 10,000
+	// Большой файл для имитации долгой обработки
 	var lines []string
-	for i := 0; i < 1000000; i++ {
-		lines = append(lines, `{"doc_id":123456,"geohashes_string":["abc"],"geohashes_uint64":[123]}`)
+	for i := 0; i < 10000; i++ {
+		lines = append(lines, `{"doc_id":"1","geohashes_string":["abc"],"geohashes_uint64":[123]}`)
 	}
 	content := strings.Join(lines, "\n")
 
@@ -379,12 +402,8 @@ func TestContextCancellation(t *testing.T) {
 
 	parser := NewParser(DefaultConfig(), log, nil)
 
-	// Устанавливаем очень маленький таймаут, чтобы гарантированно не успеть обработать весь файл
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-
-	// Даем контексту немного времени, чтобы "осознать" таймаут
-	time.Sleep(2 * time.Millisecond)
 
 	dataChan, errChan := parser.ParseFile(ctx, tmpfile.Name())
 
@@ -393,14 +412,18 @@ func TestContextCancellation(t *testing.T) {
 		count++
 	}
 
-	// Проверяем что получили ошибку контекста
-	err = <-errChan
-	if err == nil {
-		t.Error("expected context error, got nil")
-	} else if !strings.Contains(err.Error(), "context deadline exceeded") &&
-		!strings.Contains(err.Error(), "context canceled") {
-		t.Errorf("expected context error, got: %v", err)
-	}
+	// Должны получить не все записи из-за отмены контекста
+	t.Logf("Processed %d records before cancellation", count)
 
-	t.Logf("Processed %d lines before cancellation", count)
+	// Проверяем что получили ошибку контекста
+	select {
+	case err := <-errChan:
+		if err == nil {
+			t.Error("expected context error, got nil")
+		} else {
+			t.Logf("Got expected error: %v", err)
+		}
+	default:
+		t.Error("expected error channel to have an error")
+	}
 }

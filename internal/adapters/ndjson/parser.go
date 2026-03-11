@@ -1,8 +1,9 @@
-// internal/adapters/ndjson/parser.go
+// internal/adapters/ndjson/parser.go - исправляем парсинг
 package ndjson
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -74,8 +75,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string) (<-chan *domain
 
 		p.logger.Info("start parsing file",
 			ports.String("filename", filename),
-			ports.Int("batch_size", p.config.BatchSize),
-		)
+			ports.Int("batch_size", p.config.BatchSize))
 
 		// Используем буферизованное чтение
 		reader := bufio.NewReaderSize(file, p.config.MaxLineSize)
@@ -95,8 +95,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string) (<-chan *domain
 						ports.String("filename", filename),
 						ports.Int64("lines", lineNum),
 						ports.Int("valid", validCount),
-						ports.Int("errors", errorCount),
-					)
+						ports.Int("errors", errorCount))
 					return
 				}
 				if err != nil {
@@ -109,8 +108,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string) (<-chan *domain
 					p.logger.Warn("error reading line",
 						ports.String("filename", filename),
 						ports.Int64("line", lineNum),
-						ports.Error(err),
-					)
+						ports.Error(err))
 					continue
 				}
 
@@ -133,8 +131,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string) (<-chan *domain
 						ports.String("filename", filename),
 						ports.Int64("line", lineNum),
 						ports.Error(err),
-						ports.String("line_preview", p.preview(line, 100)),
-					)
+						ports.String("line_preview", p.preview(line, 100)))
 					continue
 				}
 
@@ -186,8 +183,7 @@ func (p *Parser) ParseFiles(ctx context.Context, filenames []string) (<-chan *do
 
 		p.logger.Info("finished parsing all files",
 			ports.Int("files", len(filenames)),
-			ports.Int("workers", workers),
-		)
+			ports.Int("workers", workers))
 	}()
 
 	return dataChan, errChan
@@ -267,8 +263,7 @@ func (p *Parser) fileWorker(ctx context.Context, id int, fileChan <-chan string,
 		default:
 			p.logger.Debug("worker processing file",
 				ports.Int("worker_id", id),
-				ports.String("filename", filename),
-			)
+				ports.String("filename", filename))
 
 			fileDataChan, fileErrChan := p.ParseFile(ctx, filename)
 
@@ -324,98 +319,93 @@ func (p *Parser) readLine(reader *bufio.Reader) ([]byte, error) {
 	return line, nil
 }
 
-// internal/adapters/ndjson/parser.go - исправляем парсинг doc_id
+// parseLine парсит JSON строку в GeoUpdateData
 func (p *Parser) parseLine(line []byte) (*domain.GeoUpdateData, error) {
-	var rawData struct {
-		DocID           interface{} `json:"doc_id"` // может быть строкой или числом
-		GeohashesString []string    `json:"geohashes_string"`
-		GeohashesUint64 []int64     `json:"geohashes_uint64"`
-	}
+	// Используем map для гибкого парсинга
+	var raw map[string]interface{}
 
-	if err := json.Unmarshal(line, &rawData); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	decoder.UseNumber()
+
+	if err := decoder.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
 	}
 
-	// Конвертируем DocID в uint64
+	// Парсим doc_id (может быть строкой или числом)
 	var docID uint64
-	switch v := rawData.DocID.(type) {
-	case float64:
-		docID = uint64(v)
-	case string:
-		docID, _ = strconv.ParseUint(v, 10, 64)
-	case uint64:
-		docID = v
-	default:
-		return nil, fmt.Errorf("invalid doc_id type: %T", rawData.DocID)
+	if idVal, ok := raw["doc_id"]; ok {
+		switch v := idVal.(type) {
+		case string:
+			docID, _ = strconv.ParseUint(v, 10, 64)
+		case json.Number:
+			docID, _ = strconv.ParseUint(string(v), 10, 64)
+		case float64:
+			docID = uint64(v)
+		default:
+			return nil, fmt.Errorf("doc_id has unexpected type: %T", v)
+		}
+	} else {
+		return nil, fmt.Errorf("doc_id is required")
+	}
+
+	// Парсим geohashes_string
+	var geohashesString []string
+	if gs, ok := raw["geohashes_string"]; ok {
+		if gsArr, ok := gs.([]interface{}); ok {
+			geohashesString = make([]string, len(gsArr))
+			for i, v := range gsArr {
+				geohashesString[i] = fmt.Sprintf("%v", v)
+			}
+		}
+	}
+
+	// Парсим geohashes_uint64
+	var geohashesUint64 []uint64
+	if gu, ok := raw["geohashes_uint64"]; ok {
+		if guArr, ok := gu.([]interface{}); ok {
+			geohashesUint64 = make([]uint64, len(guArr))
+			for i, v := range guArr {
+				switch val := v.(type) {
+				case json.Number:
+					num, _ := strconv.ParseUint(string(val), 10, 64)
+					geohashesUint64[i] = num
+				case float64:
+					geohashesUint64[i] = uint64(val)
+				default:
+					return nil, fmt.Errorf("geohashes_uint64[%d] has unexpected type: %T", i, v)
+				}
+			}
+		}
 	}
 
 	// Валидация
 	if p.config.Validate {
-		if err := p.validate(&rawData); err != nil {
-			return nil, err
+		if len(geohashesString) != len(geohashesUint64) {
+			return nil, fmt.Errorf("geohashes count mismatch: strings=%d, uint64=%d",
+				len(geohashesString), len(geohashesUint64))
+		}
+
+		if len(geohashesString) == 0 && len(geohashesUint64) == 0 {
+			return nil, fmt.Errorf("at least one geohash array must be non-empty")
+		}
+
+		for i, g := range geohashesString {
+			if g == "" {
+				return nil, fmt.Errorf("geohashes_string[%d] is empty", i)
+			}
+			if len(g) < 3 || len(g) > 12 {
+				return nil, fmt.Errorf("geohashes_string[%d] has invalid length: %d", i, len(g))
+			}
 		}
 	}
 
 	// Создаем доменную модель
-	uint64Geohashes := make([]uint64, len(rawData.GeohashesUint64))
-	for i, v := range rawData.GeohashesUint64 {
-		uint64Geohashes[i] = uint64(v)
-	}
-
-	data, err := domain.NewGeoUpdateData(docID, rawData.GeohashesString, uint64Geohashes)
-
+	data, err := domain.NewGeoUpdateData(docID, geohashesString, geohashesUint64)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create GeoUpdateData: %w", err)
 	}
 
 	return data, nil
-}
-
-// internal/adapters/ndjson/parser.go
-// Исправляем метод validate
-func (p *Parser) validate(data *struct {
-	DocID           interface{} `json:"doc_id"` // меняем на interface{}
-	GeohashesString []string    `json:"geohashes_string"`
-	GeohashesUint64 []int64     `json:"geohashes_uint64"`
-}) error {
-
-	// Конвертируем DocID в строку для проверки
-	var docIDStr string
-	switch v := data.DocID.(type) {
-	case float64:
-		docIDStr = strconv.FormatUint(uint64(v), 10)
-	case string:
-		docIDStr = v
-	case uint64:
-		docIDStr = strconv.FormatUint(v, 10)
-	default:
-		return fmt.Errorf("doc_id has invalid type: %T", data.DocID)
-	}
-
-	if docIDStr == "" {
-		return fmt.Errorf("doc_id is required")
-	}
-
-	if len(data.GeohashesString) == 0 && len(data.GeohashesUint64) == 0 {
-		return fmt.Errorf("at least one geohash array must be non-empty")
-	}
-
-	if len(data.GeohashesString) != len(data.GeohashesUint64) {
-		return fmt.Errorf("geohashes count mismatch: strings=%d, uint64=%d",
-			len(data.GeohashesString), len(data.GeohashesUint64))
-	}
-
-	// Проверяем что все строковые геохеши не пустые
-	for i, g := range data.GeohashesString {
-		if g == "" {
-			return fmt.Errorf("geohashes_string[%d] is empty", i)
-		}
-		if len(g) < 3 || len(g) > 12 {
-			return fmt.Errorf("geohashes_string[%d] has invalid length: %d", i, len(g))
-		}
-	}
-
-	return nil
 }
 
 // preview возвращает превью строки для логирования

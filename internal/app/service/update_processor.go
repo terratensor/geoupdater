@@ -81,44 +81,62 @@ func NewUpdateProcessor(
 	}
 }
 
-// ProcessDocuments обрабатывает поток документов с данными для обновления
+// ProcessDocuments исправляем для правильной обработки
 func (p *UpdateProcessor) ProcessDocuments(ctx context.Context, dataChan <-chan *domain.GeoUpdateData) (*domain.BatchResult, error) {
+	p.logger.Info("starting document processing")
+
 	overallResult := domain.NewBatchResult()
 
 	// Канал для передачи документов на обновление
-	updateChan := make(chan *domain.Document, p.config.BatchSize)
+	updateChan := make(chan *domain.Document, p.config.BatchSize*2) // Увеличим буфер
 	resultChan := make(chan *domain.BatchResult, p.config.Workers)
-	errorChan := make(chan error, p.config.Workers)
 
 	// Запускаем воркеров для обновления
-	var wg sync.WaitGroup
+	var wgWorkers sync.WaitGroup
 	for i := 0; i < p.config.Workers; i++ {
-		wg.Add(1)
-		go p.updateWorker(ctx, i, updateChan, resultChan, errorChan, &wg)
+		wgWorkers.Add(1)
+		go p.updateWorker(ctx, i, updateChan, resultChan, &wgWorkers)
 	}
 
 	// Горутина для сбора результатов
-	done := make(chan bool)
+	resultDone := make(chan struct{})
 	go func() {
 		for result := range resultChan {
-			overallResult.Merge(result)
+			if result != nil {
+				p.logger.Debug("received result from worker",
+					ports.String("summary", result.Summary()))
+				overallResult.Merge(result)
+			}
 		}
-		done <- true
+		close(resultDone)
 	}()
 
 	// Основной цикл обработки данных
-	var wgCollector sync.WaitGroup
-	wgCollector.Add(1)
+	processDone := make(chan struct{})
 	go func() {
-		defer wgCollector.Done()
 		defer close(updateChan)
+		defer close(processDone)
 
 		batch := make([]*domain.GeoUpdateData, 0, p.config.BatchSize)
+		batchCount := 0
 
 		for data := range dataChan {
+			batchCount++
+			// Проверяем контекст
+			select {
+			case <-ctx.Done():
+				p.logger.Info("context done, stopping processing",
+					ports.Int("processed", batchCount))
+				return
+			default:
+			}
+
 			batch = append(batch, data)
 
 			if len(batch) >= p.config.BatchSize {
+				p.logger.Debug("processing batch",
+					ports.Int("batch_size", len(batch)),
+					ports.Int("total_processed", batchCount))
 				p.processBatch(ctx, batch, updateChan)
 				batch = make([]*domain.GeoUpdateData, 0, p.config.BatchSize)
 			}
@@ -126,43 +144,51 @@ func (p *UpdateProcessor) ProcessDocuments(ctx context.Context, dataChan <-chan 
 
 		// Обрабатываем остаток
 		if len(batch) > 0 {
+			p.logger.Debug("processing final batch",
+				ports.Int("batch_size", len(batch)),
+				ports.Int("total_processed", batchCount))
 			p.processBatch(ctx, batch, updateChan)
 		}
+
+		p.logger.Info("finished processing all data",
+			ports.Int("total_records", batchCount))
 	}()
 
 	// Ждем завершения обработки
-	wgCollector.Wait()
+	<-processDone
+	p.logger.Debug("processing done, waiting for workers")
+
+	// Ждем завершения воркеров
+	wgWorkers.Wait()
+	p.logger.Debug("all workers finished")
 	close(resultChan)
-	<-done
 
-	// Проверяем ошибки
-	select {
-	case err := <-errorChan:
-		if err != nil {
-			p.logger.Error("worker error", ports.Error(err))
-		}
-	default:
-	}
-
-	// Обновляем статистику
-	p.mu.Lock()
-	p.stats.TotalProcessed += int64(overallResult.Total)
-	p.stats.TotalSuccess += int64(overallResult.Success)
-	p.stats.TotalFailed += int64(overallResult.Failed)
-	p.stats.TotalSkipped += int64(overallResult.Skipped)
-	p.stats.LastProcessed = time.Now()
-	p.mu.Unlock()
+	// Ждем сбора результатов
+	<-resultDone
+	p.logger.Debug("all results collected")
 
 	return overallResult, nil
 }
 
-// processBatch обрабатывает батч данных
+// min вспомогательная функция
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// internal/app/service/update_processor.go - исправляем processBatch
 func (p *UpdateProcessor) processBatch(ctx context.Context, batch []*domain.GeoUpdateData, updateChan chan<- *domain.Document) {
 	// Собираем все ID для пакетного поиска
 	ids := make([]uint64, len(batch))
 	for i, data := range batch {
 		ids[i] = data.DocID
 	}
+
+	p.logger.Debug("processing batch",
+		ports.Int("batch_size", len(batch)),
+		ports.Any("first_few_ids", ids[:min(5, len(ids))]))
 
 	// Получаем существующие документы
 	existingDocs, err := p.repo.GetDocumentsBatch(ctx, ids)
@@ -177,6 +203,10 @@ func (p *UpdateProcessor) processBatch(ctx context.Context, batch []*domain.GeoU
 		}
 		return
 	}
+
+	p.logger.Debug("found documents",
+		ports.Int("requested", len(ids)),
+		ports.Int("found", len(existingDocs)))
 
 	// Обрабатываем каждый документ
 	for _, data := range batch {
@@ -193,11 +223,17 @@ func (p *UpdateProcessor) processBatch(ctx context.Context, batch []*domain.GeoU
 				continue
 			}
 
+			p.logger.Debug("sending document to update channel",
+				ports.Uint64("id", doc.ID))
+
 			// Отправляем на обновление
 			select {
 			case <-ctx.Done():
+				p.logger.Debug("context done while sending to update channel")
 				return
 			case updateChan <- doc:
+				p.logger.Debug("document sent to update channel",
+					ports.Uint64("id", doc.ID))
 			}
 		} else {
 			// Документ не найден
@@ -248,11 +284,18 @@ func (p *UpdateProcessor) processSingle(ctx context.Context, data *domain.GeoUpd
 	}
 }
 
-// updateWorker воркер для обновления документов
+// updateWorker исправляем для обработки документов
 func (p *UpdateProcessor) updateWorker(ctx context.Context, id int, updateChan <-chan *domain.Document,
-	resultChan chan<- *domain.BatchResult, errorChan chan<- error, wg *sync.WaitGroup) {
+	resultChan chan<- *domain.BatchResult, wg *sync.WaitGroup) {
 
 	defer wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			p.logger.Error("worker panicked",
+				ports.Int("worker_id", id),
+				ports.Any("panic", r))
+		}
+	}()
 
 	p.logger.Debug("update worker started", ports.Int("worker_id", id))
 
@@ -262,6 +305,18 @@ func (p *UpdateProcessor) updateWorker(ctx context.Context, id int, updateChan <
 	flushBatch := func() {
 		if len(batch) == 0 {
 			return
+		}
+
+		p.logger.Debug("worker flushing batch",
+			ports.Int("worker_id", id),
+			ports.Int("batch_size", len(batch)))
+
+		// Проверяем контекст перед отправкой
+		select {
+		case <-ctx.Done():
+			p.logger.Debug("context done, not sending batch")
+			return
+		default:
 		}
 
 		result, err := p.repo.BulkReplace(ctx, batch)
@@ -275,6 +330,9 @@ func (p *UpdateProcessor) updateWorker(ctx context.Context, id int, updateChan <
 				batchResult.AddFailed(doc.ID, err, domain.ErrorTypeManticore, 1)
 			}
 		} else {
+			p.logger.Debug("bulk replace successful",
+				ports.Int("worker_id", id),
+				ports.String("summary", result.Summary()))
 			batchResult.Merge(result)
 		}
 
@@ -284,20 +342,40 @@ func (p *UpdateProcessor) updateWorker(ctx context.Context, id int, updateChan <
 	for {
 		select {
 		case <-ctx.Done():
+			p.logger.Debug("worker context done", ports.Int("worker_id", id))
 			flushBatch()
-			resultChan <- batchResult
+			// Проверяем что канал результата не закрыт
+			select {
+			case resultChan <- batchResult:
+				p.logger.Debug("worker sent final result", ports.Int("worker_id", id))
+			default:
+				p.logger.Debug("result channel full or closed", ports.Int("worker_id", id))
+			}
 			return
 
 		case doc, ok := <-updateChan:
 			if !ok {
+				p.logger.Debug("update channel closed", ports.Int("worker_id", id))
 				flushBatch()
-				resultChan <- batchResult
+				// Проверяем что канал результата не закрыт
+				select {
+				case resultChan <- batchResult:
+					p.logger.Debug("worker sent final result", ports.Int("worker_id", id))
+				default:
+				}
 				return
 			}
+
+			p.logger.Debug("worker received document",
+				ports.Int("worker_id", id),
+				ports.Uint64("id", doc.ID))
 
 			batch = append(batch, doc)
 
 			if len(batch) >= p.config.BatchSize {
+				p.logger.Debug("batch full, flushing",
+					ports.Int("worker_id", id),
+					ports.Int("batch_size", len(batch)))
 				flushBatch()
 			}
 		}
