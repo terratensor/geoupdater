@@ -1,4 +1,4 @@
-// cmd/geoupdater/main.go - финальная чистая версия
+// cmd/geoupdater/main.go - финальная версия без -stats
 package main
 
 import (
@@ -29,8 +29,8 @@ func main() {
 		pattern     = flag.String("pattern", "*.ndjson", "file pattern to match")
 		mode        = flag.String("mode", "", "update mode: replace or merge (overrides config)")
 		reprocess   = flag.Bool("reprocess", false, "reprocess failed records")
-		showStats   = flag.Bool("stats", false, "show processing stats")
 		versionFlag = flag.Bool("version", false, "show version")
+		reportsDir  = flag.String("reports", "reports", "directory to save processing reports")
 	)
 	flag.Parse()
 
@@ -173,13 +173,6 @@ func main() {
 		})
 	}()
 
-	// Показываем статистику если запрошено
-	if *showStats {
-		stats := processor.GetStats()
-		log.Info("current statistics", ports.Any("stats", stats))
-		return
-	}
-
 	// Репроцессинг failed записей
 	if *reprocess {
 		log.Info("starting reprocessing of failed records")
@@ -226,26 +219,45 @@ func main() {
 	// Выводим список файлов
 	log.Info("processing files", ports.Any("files", filenames))
 
-	// Обрабатываем файлы
+	// Создаем директорию для отчетов
+	if err := os.MkdirAll(*reportsDir, 0755); err != nil {
+		log.Warn("failed to create reports directory",
+			ports.String("dir", *reportsDir),
+			ports.Error(err))
+	}
+
+	// Обрабатываем файлы с формированием отчета
 	start := time.Now()
-	result, err := processor.ProcessFiles(ctx, filenames)
+	report, err := processor.ProcessFilesWithReport(ctx, filenames)
 	if err != nil {
 		log.Error("processing failed", ports.Error(err))
+	}
+
+	// Сохраняем отчет
+	if report != nil {
+		if err := report.Save(*reportsDir); err != nil {
+			log.Error("failed to save report",
+				ports.String("dir", *reportsDir),
+				ports.Error(err))
+		} else {
+			// Выводим сводку в консоль
+			fmt.Println("\n" + report.Summary())
+			log.Info("report saved",
+				ports.String("dir", *reportsDir),
+				ports.String("file", fmt.Sprintf("report_%s.json", start.Format("20060102_150405"))))
+		}
 	}
 
 	duration := time.Since(start)
 
 	// Выводим итоговую статистику
-	log.Info("processing completed",
-		ports.String("summary", result.Summary()),
-		ports.Int64("duration_ms", duration.Milliseconds()))
-
 	stats := processor.GetStats()
-	log.Info("final statistics",
-		ports.Any("stats", stats))
+	log.Info("processing completed",
+		ports.Int64("duration_ms", duration.Milliseconds()))
+	log.Info("final statistics", ports.Any("stats", stats))
 
 	// Если были ошибки, выходим с ненулевым кодом
-	if result.Failed > 0 {
+	if report != nil && report.Stats.TotalFailed > 0 {
 		os.Exit(1)
 	}
 }
