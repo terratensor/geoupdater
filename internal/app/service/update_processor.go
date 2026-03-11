@@ -1,9 +1,10 @@
-// internal/app/service/update_processor.go
+// internal/app/service/update_processor.go - исправленная версия с отчетом
 package service
 
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -81,14 +82,14 @@ func NewUpdateProcessor(
 	}
 }
 
-// ProcessDocuments исправляем для правильной обработки
+// ProcessDocuments обрабатывает поток документов с данными для обновления
 func (p *UpdateProcessor) ProcessDocuments(ctx context.Context, dataChan <-chan *domain.GeoUpdateData) (*domain.BatchResult, error) {
 	p.logger.Info("starting document processing")
 
 	overallResult := domain.NewBatchResult()
 
 	// Канал для передачи документов на обновление
-	updateChan := make(chan *domain.Document, p.config.BatchSize*2) // Увеличим буфер
+	updateChan := make(chan *domain.Document, p.config.BatchSize*2)
 	resultChan := make(chan *domain.BatchResult, p.config.Workers)
 
 	// Запускаем воркеров для обновления
@@ -170,15 +171,7 @@ func (p *UpdateProcessor) ProcessDocuments(ctx context.Context, dataChan <-chan 
 	return overallResult, nil
 }
 
-// min вспомогательная функция
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// internal/app/service/update_processor.go - исправляем processBatch
+// processBatch обрабатывает батч данных
 func (p *UpdateProcessor) processBatch(ctx context.Context, batch []*domain.GeoUpdateData, updateChan chan<- *domain.Document) {
 	// Собираем все ID для пакетного поиска
 	ids := make([]uint64, len(batch))
@@ -284,7 +277,7 @@ func (p *UpdateProcessor) processSingle(ctx context.Context, data *domain.GeoUpd
 	}
 }
 
-// updateWorker исправляем для обработки документов
+// updateWorker воркер для обновления документов
 func (p *UpdateProcessor) updateWorker(ctx context.Context, id int, updateChan <-chan *domain.Document,
 	resultChan chan<- *domain.BatchResult, wg *sync.WaitGroup) {
 
@@ -436,6 +429,99 @@ func (p *UpdateProcessor) ProcessFile(ctx context.Context, filename string) (*do
 	return result, nil
 }
 
+// ProcessFileWithReport обрабатывает один файл и возвращает детальный отчет
+func (p *UpdateProcessor) ProcessFileWithReport(ctx context.Context, filename string) (*domain.FileReport, error) {
+	p.logger.Info("processing file", ports.String("filename", filename))
+
+	startTime := time.Now()
+
+	// Получаем размер файла
+	fileInfo, err := os.Stat(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	// Создаем канал для данных и собираем ID в процессе обработки
+	dataChan := make(chan *domain.GeoUpdateData, p.config.BatchSize)
+
+	// Запускаем парсер в отдельной горутине
+	parseDataChan, parseErrChan := p.parser.ParseFile(ctx, filename)
+
+	// Счетчики для отчета
+	var validCount, errorCount int
+	var firstID, lastID uint64
+	var allIDs []uint64
+
+	// Горутина для сбора данных и статистики
+	go func() {
+		defer close(dataChan)
+
+		for data := range parseDataChan {
+			validCount++
+			allIDs = append(allIDs, data.DocID)
+			if firstID == 0 {
+				firstID = data.DocID
+			}
+			lastID = data.DocID
+
+			// Передаем данные дальше для обработки
+			select {
+			case <-ctx.Done():
+				return
+			case dataChan <- data:
+			}
+		}
+		p.logger.Debug("collected IDs for report",
+			ports.Int("count", len(allIDs)),
+			ports.Uint64("first", firstID),
+			ports.Uint64("last", lastID))
+	}()
+
+	// Горутина для сбора ошибок парсинга
+	go func() {
+		for err := range parseErrChan {
+			errorCount++
+			p.logger.Error("parse error",
+				ports.String("filename", filename),
+				ports.Error(err))
+		}
+	}()
+
+	// Обрабатываем документы
+	result, err := p.ProcessDocuments(ctx, dataChan)
+	if err != nil {
+		return nil, fmt.Errorf("failed to process documents: %w", err)
+	}
+
+	endTime := time.Now()
+
+	// ВАЖНО: result.Success считает батчи, а нам нужно количество документов
+	// Используем validCount как количество обработанных документов
+	report := &domain.FileReport{
+		Filename:  filename,
+		Size:      fileInfo.Size(),
+		Lines:     validCount + errorCount,
+		Valid:     validCount,
+		Errors:    errorCount,
+		StartTime: startTime,
+		EndTime:   endTime,
+		Duration:  endTime.Sub(startTime).String(),
+		Success:   validCount,    // Используем validCount вместо result.Success
+		Failed:    result.Failed, // Количество документов, которые не удалось обновить
+		Skipped:   result.Skipped,
+		FirstID:   firstID,
+		LastID:    lastID,
+	}
+
+	p.logger.Info("file processing completed",
+		ports.String("filename", filename),
+		ports.Int("documents", validCount),
+		ports.Int("batches", result.Success), // Для информации
+		ports.Any("report", report))
+
+	return report, nil
+}
+
 // ProcessFiles обрабатывает несколько файлов
 func (p *UpdateProcessor) ProcessFiles(ctx context.Context, filenames []string) (*domain.BatchResult, error) {
 	p.logger.Info("processing multiple files", ports.Int("count", len(filenames)))
@@ -460,6 +546,44 @@ func (p *UpdateProcessor) ProcessFiles(ctx context.Context, filenames []string) 
 	}
 
 	return overallResult, nil
+}
+
+// ProcessFilesWithReport обрабатывает несколько файлов и возвращает общий отчет
+func (p *UpdateProcessor) ProcessFilesWithReport(ctx context.Context, filenames []string) (*domain.ProcessingReport, error) {
+	p.logger.Info("processing multiple files", ports.Int("count", len(filenames)))
+
+	report := domain.NewProcessingReport(
+		"1.0.0",
+		p.config.UpdateMode,
+		p.config.Workers,
+		p.config.BatchSize,
+	)
+
+	for _, filename := range filenames {
+		select {
+		case <-ctx.Done():
+			report.Complete()
+			return report, ctx.Err()
+		default:
+			fileReport, err := p.ProcessFileWithReport(ctx, filename)
+			if err != nil {
+				p.logger.Error("failed to process file",
+					ports.String("filename", filename),
+					ports.Error(err))
+				// Добавляем минимальный отчет с ошибкой
+				fileReport = &domain.FileReport{
+					Filename: filename,
+					Errors:   1,
+				}
+			}
+			if fileReport != nil {
+				report.AddFile(*fileReport)
+			}
+		}
+	}
+
+	report.Complete()
+	return report, nil
 }
 
 // ReprocessFailed повторно обрабатывает неудачные записи
@@ -511,9 +635,6 @@ func (p *UpdateProcessor) ReprocessFailed(ctx context.Context) (*domain.BatchRes
 
 	// Очищаем успешно обработанные записи
 	if result.Success > 0 {
-		// Собираем ID успешно обработанных
-		// В реальности нужно более точно отслеживать какие записи успешно обработаны
-		// Для простоты пока пропускаем
 		p.logger.Info("records successfully reprocessed",
 			ports.Int("success", result.Success))
 	}
@@ -563,4 +684,12 @@ func (p *UpdateProcessor) ResetStats() {
 	p.stats = &ProcessorStats{
 		StartTime: time.Now(),
 	}
+}
+
+// min вспомогательная функция
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

@@ -1,0 +1,38 @@
+services:
+  manticore:
+    image: manticoresearch/manticore:latest
+    ports:
+      - "9306:9306"  # SQL protocol
+      - "9308:9308"  # HTTP protocol
+    volumes:
+      - manticore_data:/var/lib/manticore
+    command: --log /var/log/manticore/searchd.log --query-log /var/log/manticore/query.log
+    healthcheck:
+      test: ["CMD", "mysql", "-h127.0.0.1", "-P9306", "-e", "SHOW TABLES"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  geoupdater:
+    build: .
+    depends_on:
+      manticore:
+        condition: service_healthy
+    environment:
+      - MANTICORE_HOST=manticore
+      - MANTICORE_PORT=9308
+      - MANTICORE_TABLE=library2026
+      - UPDATE_MODE=merge
+      - BATCH_SIZE=1000
+      - WORKERS=5
+      - LOG_LEVEL=info
+    volumes:
+      - ./data:/app/data
+      - ./failed:/app/failed
+      - ./logs:/app/logs
+      - ./reports:/app/reports
+      - ./results.ndjson:/app/data/results.ndjson
+    command: -dir /app/data -mode merge
+
+volumes:
+  manticore_data:

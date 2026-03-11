@@ -1,26 +1,335 @@
 # GeoUpdater
 
-Сервис для обновления геоданных в Manticore Search.
+Сервис для массового обновления геоданных в Manticore Search.
 
-## Описание
+## 🚀 Возможности
 
-GeoUpdater обрабатывает NDJSON файлы с геоданными и обновляет записи в таблице Manticore Search.
+- **Массовая обработка** NDJSON файлов с геоданными
+- **Два режима обновления**: REPLACE (полная замена) и MERGE (слияние)
+- **Пакетная обработка** с настраиваемым размером батча
+- **Параллельная обработка** нескольких файлов
+- **Graceful shutdown** с сохранением прогресса
+- **Детальные отчеты** о каждой обработке
+- **Хранение failed записей** для повторной обработки
+- **Поддержка больших чисел** (uint64) без потери точности
+
+## 📋 Требования
+
+- Go 1.21+
+- Manticore Search 5.0.0+
+- NDJSON файлы с геоданными
+
+## 🔧 Установка
+
+### Из исходников
+```bash
+git clone https://github.com/terratensor/geoupdater.git
+cd geoupdater
+make build
+```
+### Docker
+```bash
+docker build -t geoupdater:latest .
+```
 
 ## Архитектура
 
-Проект построен с использованием гексагональной архитектуры (ports & adapters).
+Проект построен на гексагональной архитектуре (ports & adapters):
 
-### Компоненты:
+- **core/domain** - бизнес-логика и модели данных
+- **core/ports** - интерфейсы для взаимодействия с внешним миром
+- **adapters/** - реализации портов (Manticore, NDJSON, логгер, failed storage)
+- **app/service** - координация всех компонентов
 
-- **Core Domain**: Бизнес-логика и модели данных
-- **Ports**: Интерфейсы для взаимодействия с внешним миром
-- **Adapters**: Реализации портов (Manticore, NDJSON парсер, логгер)
+## Особенности работы с ID
+
+**Критически важно:** В Manticore Search ID документов хранятся как 64-битные целые числа.
+В нашем сервисе мы используем `uint64` для всех ID, чтобы избежать потери точности при парсинге JSON.
+
+```go
+type Document struct {
+    ID uint64 `json:"id"` // ВАЖНО: всегда uint64, не string!
+}
+
+type GeoUpdateData struct {
+    DocID uint64 `json:"doc_id"` // В JSON может приходить как строка или число
+}
+```
+
+При парсинге NDJSON файлов мы используем `json.Number` для сохранения точности:
+```go
+decoder := json.NewDecoder(bytes.NewReader(line))
+decoder.UseNumber() // Критически важно для больших чисел!
+```
 
 ## Режимы работы
 
-- **replace**: Полная замена геоданных
-- **merge**: Слияние геоданных с сохранением уникальности
+### 1. REPLACE (полная замена)
+```bash
+./geoupdater -dir ./data -mode replace
+```
+Старые геоданные полностью заменяются новыми.
+
+### 2. MERGE (слияние) - ПО УМОЛЧАНИЮ
+```bash
+./geoupdater -dir ./data -mode merge
+```
+Новые геохеши добавляются к существующим, дубликаты удаляются.
 
 ## Конфигурация
 
-Настройки через переменные окружения или .env файл.
+### Переменные окружения (.env)
+
+```env
+# Manticore connection
+MANTICORE_HOST=localhost
+MANTICORE_PORT=9308
+MANTICORE_TABLE=library2026
+MANTICORE_TIMEOUT=30s
+MANTICORE_MAX_CONNS=10
+
+# Processing
+UPDATE_MODE=merge              # replace или merge
+BATCH_SIZE=1000                # документов в батче
+WORKERS=5                      # параллельных воркеров
+MAX_RETRIES=3                   # попыток при ошибке
+RETRY_DELAY=1s                  # задержка между попытками
+
+# Files
+INPUT_DIR=./data
+FILE_PATTERN=*.ndjson
+FAILED_DIR=./failed
+REPORTS_DIR=./reports
+
+# Logging
+LOG_LEVEL=info                  # debug, info, warn, error
+LOG_FILE=./logs/geoupdater.log
+```
+
+### Флаги командной строки
+
+| Флаг | Описание | Пример |
+|------|----------|--------|
+| `-dir` | Директория с файлами | `-dir ./data` |
+| `-files` | Конкретные файлы (через запятую) | `-files file1.ndjson,file2.ndjson` |
+| `-pattern` | Маска файлов | `-pattern "*.ndjson"` |
+| `-mode` | Режим обновления | `-mode merge` |
+| `-reprocess` | Повторная обработка failed записей | `-reprocess` |
+| `-reports` | Директория для отчетов | `-reports ./reports` |
+| `-version` | Версия | `-version` |
+
+## Детали реализации
+
+### Парсер NDJSON
+
+- Использует потоковое чтение (`bufio.Reader`) для работы с большими файлами
+- Поддерживает параллельную обработку нескольких файлов (`workers`)
+- Валидирует геохеши (длина 3-12 символов)
+- Сохраняет точность ID через `json.Number`
+
+### Manticore клиент
+
+Два способа взаимодействия:
+
+1. **JSON Search API** - для поиска документов
+   ```json
+   {
+     "table": "library2026",
+     "query": { "in": { "id": [123, 456, 789] } }
+   }
+   ```
+
+2. **Bulk API** - для массового обновления
+   ```json
+   { "replace": { "index": "library2026", "id": 123, "doc": {...} } }
+   { "replace": { "index": "library2026", "id": 456, "doc": {...} } }
+   ```
+
+**Важно:** В ответе на bulk запрос ключ называется `"bulk"`, а не `"replace"`:
+```json
+{
+  "items": [{
+    "bulk": {           // <-- ВНИМАНИЕ: не "replace"!
+      "_id": 123,
+      "result": "updated"
+    }
+  }]
+}
+```
+
+### Failed Records
+
+Неудачные записи сохраняются в `./failed/failed_YYYYMMDD_HHMMSS.ndjson`:
+```json
+{
+  "data": {
+    "doc_id": 6056452479959171091,
+    "geohashes_string": ["test1", "test2"],
+    "geohashes_uint64": [111111, 222222]
+  },
+  "error": "document not found",
+  "attempts": 1,
+  "timestamp": 1741712807,
+  "filename": "data/results.ndjson"
+}
+```
+
+Автоматическая ротация:
+- По размеру (по умолчанию 100MB)
+- По времени (каждый день)
+- Очистка старых записей (по умолчанию 7 дней)
+
+### Graceful Shutdown
+
+При получении сигналов `SIGINT` (Ctrl+C) или `SIGTERM`:
+1. Завершается прием новых данных
+2. Завершаются текущие операции (таймаут 2 секунды)
+3. Сохраняется статистика
+4. Принудительное завершение через 5 секунд
+
+## Примеры использования
+
+### 1. Обработка всех файлов в директории
+```bash
+./geoupdater -dir ./data -mode merge
+```
+
+### 2. Обработка конкретных файлов
+```bash
+./geoupdater -files ./data/file1.ndjson,./data/file2.ndjson
+```
+
+### 3. Повторная обработка failed записей
+```bash
+./geoupdater -reprocess
+```
+
+## 🐳 Docker
+
+### Запуск с docker-compose
+```bash
+# Создаем структуру директорий
+mkdir -p data failed logs reports
+
+# Копируем файлы для обработки
+cp results.ndjson data/
+
+# Запускаем
+docker-compose up
+```
+
+### Запуск отдельного контейнера
+```bash
+docker run --rm \
+  --network host \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/failed:/app/failed \
+  -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/reports:/app/reports \
+  geoupdater:latest -dir /app/data -mode merge
+```
+
+
+## Отчеты
+
+После каждой обработки создается детальный отчет в `./reports/report_YYYYMMDD_HHMMSS.json`:
+
+```json
+{
+  "version": "1.0.0",
+  "start_time": "2026-03-11T19:58:55.366776184+03:00",
+  "end_time": "2026-03-11T19:59:00.455217832+03:00",
+  "duration": "5.088441638s",
+  "mode": "replace",
+  "workers": 5,
+  "batch_size": 1000,
+  "files": [
+    {
+      "filename": "data/results.ndjson",
+      "size_bytes": 51300925,
+      "lines": 37820,
+      "valid": 37820,
+      "errors": 0,
+      "start_time": "2026-03-11T19:58:55.366792254+03:00",
+      "end_time": "2026-03-11T19:59:00.455126109+03:00",
+      "duration": "5.088333845s",
+      "success": 37820,
+      "failed": 0,
+      "skipped": 0,
+      "first_id": 6056452479959171123,
+      "last_id": 6056452479959242174
+    }
+  ],
+  "total_files": 1,
+  "stats": {
+    "total_processed": 37820,
+    "total_success": 37820,
+    "total_failed": 0,
+    "total_skipped": 0,
+    "total_files": 0
+  },
+  "min_id": 6056452479959171123,
+  "max_id": 6056452479959242174,
+  "first_id": 6056452479959171123,
+  "last_id": 6056452479959242174
+}
+```
+
+## Производительность
+
+- **37,820 документов** обработано за **5,09 секунды** (тестовые данные)
+- Скорость: **~7,430 документов/сек**
+- Время на документ: ~0.13 мс
+- При увеличении `WORKERS` и `BATCH_SIZE` производительность растет линейно
+
+
+## ⚠️ Важные особенности
+
+### 1. Работа с ID
+```go
+// ВАЖНО: Все ID должны быть uint64!
+type Document struct {
+    ID uint64 `json:"id"`  // Никогда не используйте string!
+}
+```
+
+### 2. JSON парсинг
+```go
+// Всегда используйте decoder.UseNumber() для больших чисел
+decoder := json.NewDecoder(bytes.NewReader(line))
+decoder.UseNumber() // Критически важно!
+```
+
+### 3. Bulk ответ Manticore
+```json
+// В ответе на bulk запрос ключ называется "bulk", а не "replace"
+{
+  "items": [{
+    "bulk": {           // <-- ВНИМАНИЕ!
+      "_id": 123,
+      "result": "updated"
+    }
+  }]
+}
+```
+### 4. Merge режим
+- Сохраняет уникальность геохешей
+- Автоматически сортирует для консистентности
+- Обновляет `updated_at` timestamp
+
+### 5. Graceful shutdown
+- При получении SIGINT/SIGTERM дает 2 секунды на завершение
+- Принудительное завершение через 5 секунд
+- Сохраняет статистику и отчеты
+
+
+## 🛠️ Команды Makefile
+
+```bash
+make build          # Сборка проекта
+make run ARGS="-h"  # Запуск с аргументами
+make test           # Запуск тестов
+make clean          # Очистка
+make docker-build   # Сборка Docker образа
+make docker-run     # Запуск в Docker
+```

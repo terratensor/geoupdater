@@ -4,7 +4,6 @@
 *.dll
 *.so
 *.dylib
-geoupdater
 
 # Test binary
 *.test
@@ -30,7 +29,11 @@ logs/
 data/
 failed/logs
 *.ndjson
+reports/
 
 # Environment
 .env
 .env.local
+
+# Build
+build/
