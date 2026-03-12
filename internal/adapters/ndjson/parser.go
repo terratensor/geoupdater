@@ -248,6 +248,113 @@ func (p *Parser) ParseReader(ctx context.Context, reader io.Reader) (<-chan *dom
 	return dataChan, errChan
 }
 
+// internal/adapters/ndjson/parser.go - добавляем новые методы
+
+// ParseNERLine парсит строку в NERData
+func (p *Parser) ParseNERLine(line []byte) (*domain.NERData, error) {
+	var data domain.NERData
+
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	decoder.UseNumber()
+
+	if err := decoder.Decode(&data); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal NER JSON: %w", err)
+	}
+
+	// Валидация
+	if data.DocID == 0 {
+		return nil, fmt.Errorf("doc_id is required")
+	}
+
+	return &data, nil
+}
+
+// ParseNERFile читает NER файл и возвращает канал с данными
+func (p *Parser) ParseNERFile(ctx context.Context, filename string) (<-chan *domain.NERData, <-chan error) {
+	dataChan := make(chan *domain.NERData, p.config.BatchSize)
+	errChan := make(chan error, 1)
+
+	go func() {
+		defer close(dataChan)
+		defer close(errChan)
+
+		file, err := os.Open(filename)
+		if err != nil {
+			errChan <- fmt.Errorf("failed to open file %s: %w", filename, err)
+			return
+		}
+		defer file.Close()
+
+		p.logger.Info("start parsing NER file",
+			ports.String("filename", filename),
+			ports.Int("batch_size", p.config.BatchSize))
+
+		reader := bufio.NewReaderSize(file, p.config.MaxLineSize)
+
+		var lineNum int64
+		var validCount, errorCount int
+
+		for {
+			select {
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			default:
+				line, err := p.readLine(reader)
+				if err == io.EOF {
+					p.logger.Info("finished parsing NER file",
+						ports.String("filename", filename),
+						ports.Int64("lines", lineNum),
+						ports.Int("valid", validCount),
+						ports.Int("errors", errorCount))
+					return
+				}
+				if err != nil {
+					errorCount++
+					if !p.config.SkipErrors {
+						errChan <- fmt.Errorf("error reading file %s at line %d: %w",
+							filename, lineNum, err)
+						return
+					}
+					continue
+				}
+
+				lineNum++
+
+				if len(line) == 0 {
+					continue
+				}
+
+				data, err := p.ParseNERLine(line)
+				if err != nil {
+					errorCount++
+					if !p.config.SkipErrors {
+						errChan <- fmt.Errorf("error parsing line %d: %w", lineNum, err)
+						return
+					}
+					p.logger.Warn("error parsing NER line",
+						ports.String("filename", filename),
+						ports.Int64("line", lineNum),
+						ports.Error(err),
+						ports.String("line_preview", p.preview(line, 100)))
+					continue
+				}
+
+				validCount++
+
+				select {
+				case <-ctx.Done():
+					errChan <- ctx.Err()
+					return
+				case dataChan <- data:
+				}
+			}
+		}
+	}()
+
+	return dataChan, errChan
+}
+
 // fileWorker обрабатывает файлы из канала
 func (p *Parser) fileWorker(ctx context.Context, id int, fileChan <-chan string,
 	dataChan chan<- *domain.GeoUpdateData, errChan chan<- error, wg *sync.WaitGroup) {
