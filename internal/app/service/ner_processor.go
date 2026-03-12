@@ -4,11 +4,13 @@ package service
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/terratensor/geoupdater/internal/core/domain"
 	"github.com/terratensor/geoupdater/internal/core/ports"
+	"github.com/terratensor/geoupdater/internal/version"
 )
 
 // NERProcessor обработчик NER данных
@@ -167,14 +169,16 @@ func (p *NERProcessor) processBatch(ctx context.Context, batch []*domain.NERData
 	p.logger.Debug("processing NER batch", ports.Int("batch_size", len(batch)))
 
 	for _, data := range batch {
-		doc, err := domain.NewNERDocumentFromData(data)
-		if err != nil {
-			p.logger.Error("failed to create NER document",
-				ports.Uint64("doc_id", data.DocID),
-				ports.Error(err))
+		// NewNERDocumentFromData теперь возвращает только документ, без ошибки
+		doc := domain.NewNERDocumentFromData(data)
+
+		// Валидация при необходимости
+		if doc.DocID == 0 {
+			p.logger.Error("invalid document: missing doc_id",
+				ports.Any("data", data))
 
 			if p.config.SaveFailed {
-				p.saveFailedRecord(ctx, data, err, "")
+				p.saveFailedRecord(ctx, data, fmt.Errorf("missing doc_id"), "")
 			}
 			continue
 		}
@@ -216,6 +220,7 @@ func (p *NERProcessor) updateWorker(ctx context.Context, id int,
 				ports.Int("batch_size", len(batch)),
 				ports.Error(err))
 
+			// Добавляем все документы как failed
 			for _, doc := range batch {
 				batchResult.AddFailed(doc.DocID, err, domain.ErrorTypeManticore, 1)
 			}
@@ -327,7 +332,20 @@ func (p *NERProcessor) ProcessFiles(ctx context.Context, filenames []string) (*d
 		case <-ctx.Done():
 			return overallResult, ctx.Err()
 		default:
-			result, err := p.ProcessFile(ctx, filename)
+			// Парсим файл
+			dataChan, errChan := p.parser.ParseNERFile(ctx, filename)
+
+			// Запускаем горутину для сбора ошибок
+			go func() {
+				for err := range errChan {
+					p.logger.Error("NER parse error",
+						ports.String("filename", filename),
+						ports.Error(err))
+				}
+			}()
+
+			// Обрабатываем документы напрямую из канала
+			result, err := p.ProcessDocuments(ctx, dataChan)
 			if err != nil {
 				p.logger.Error("failed to process NER file",
 					ports.String("filename", filename),
@@ -340,6 +358,144 @@ func (p *NERProcessor) ProcessFiles(ctx context.Context, filenames []string) (*d
 	}
 
 	return overallResult, nil
+}
+
+// ProcessFilesWithReport обрабатывает несколько NER файлов и возвращает отчет
+func (p *NERProcessor) ProcessFilesWithReport(ctx context.Context, filenames []string) (*domain.ProcessingReport, error) {
+	p.logger.Info("processing multiple NER files", ports.Int("count", len(filenames)))
+
+	report := domain.NewProcessingReport(
+		version.Short(),
+		"ner",
+		p.config.Workers,
+		p.config.BatchSize,
+	)
+
+	totalDocuments := 0
+	overallResult := domain.NewBatchResult()
+
+	for _, filename := range filenames {
+		select {
+		case <-ctx.Done():
+			report.Complete()
+			return report, ctx.Err()
+		default:
+			fileReport, result, err := p.processFileWithReport(ctx, filename)
+			if err != nil {
+				p.logger.Error("failed to process NER file",
+					ports.String("filename", filename),
+					ports.Error(err))
+				fileReport = &domain.FileReport{
+					Filename: filename,
+					Errors:   1,
+				}
+			}
+			if fileReport != nil {
+				report.AddFile(*fileReport)
+			}
+			if result != nil {
+				overallResult.Merge(result)
+				totalDocuments += fileReport.Valid
+			}
+		}
+	}
+
+	report.Complete()
+
+	// Выводим сводку в консоль
+	fmt.Println("\n=== NER Processing Report ===")
+	fmt.Printf("Version:     %s\n", report.Version)
+	fmt.Printf("Mode:        %s\n", report.Mode)
+	fmt.Printf("Duration:    %s\n", report.Duration)
+	fmt.Printf("Files:       %d\n", report.TotalFiles)
+	fmt.Printf("Documents:   %d\n", totalDocuments)
+	fmt.Printf("Success:     %d\n", overallResult.Success)
+	fmt.Printf("Failed:      %d\n", overallResult.Failed)
+	fmt.Printf("Skipped:     %d\n", overallResult.Skipped)
+	fmt.Println("================================")
+
+	return report, nil
+}
+
+// processFileWithReport обрабатывает один NER файл и возвращает отчет
+func (p *NERProcessor) processFileWithReport(ctx context.Context, filename string) (*domain.FileReport, *domain.BatchResult, error) {
+	p.logger.Info("processing NER file", ports.String("filename", filename))
+
+	startTime := time.Now()
+
+	// Получаем размер файла
+	fileInfo, err := os.Stat(filename)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	// Парсим файл и собираем данные
+	dataChan, errChan := p.parser.ParseNERFile(ctx, filename)
+
+	// Собираем все данные в слайс, чтобы знать количество
+	var allData []*domain.NERData
+	var firstID, lastID uint64
+	var parseErrors int
+
+	for data := range dataChan {
+		allData = append(allData, data)
+		if firstID == 0 {
+			firstID = data.DocID
+		}
+		lastID = data.DocID
+	}
+
+	// Проверяем ошибки парсинга
+	select {
+	case err := <-errChan:
+		if err != nil {
+			parseErrors++
+			p.logger.Error("parse error", ports.Error(err))
+		}
+	default:
+	}
+
+	if len(allData) == 0 {
+		return nil, nil, fmt.Errorf("no valid data in file")
+	}
+
+	// Создаем новый канал для обработки
+	processChan := make(chan *domain.NERData, len(allData))
+	for _, data := range allData {
+		processChan <- data
+	}
+	close(processChan)
+
+	// Обрабатываем документы
+	result, err := p.ProcessDocuments(ctx, processChan)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	endTime := time.Now()
+
+	fileReport := &domain.FileReport{
+		Filename:  filename,
+		Size:      fileInfo.Size(),
+		Lines:     len(allData) + parseErrors,
+		Valid:     len(allData),
+		Errors:    parseErrors,
+		StartTime: startTime,
+		EndTime:   endTime,
+		Duration:  endTime.Sub(startTime).String(),
+		Success:   result.Success,
+		Failed:    result.Failed,
+		Skipped:   result.Skipped,
+		FirstID:   firstID,
+		LastID:    lastID,
+	}
+
+	p.logger.Info("NER file processing completed",
+		ports.String("filename", filename),
+		ports.Int("documents", len(allData)),
+		ports.String("result", result.Summary()))
+
+	return fileReport, result, nil
 }
 
 // GetStats возвращает статистику NER обработки

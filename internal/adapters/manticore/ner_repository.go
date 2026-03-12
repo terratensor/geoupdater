@@ -2,9 +2,13 @@
 package manticore
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -99,7 +103,6 @@ func (r *ManticoreNERRepository) GetDocument(ctx context.Context, docID uint64) 
 
 	// Парсим ответ как массив
 	if resp != nil {
-		// Пробуем получить как массив
 		actual := resp.GetActualInstance()
 		if arr, ok := actual.([]map[string]interface{}); ok && len(arr) > 0 {
 			row := arr[0]
@@ -111,15 +114,29 @@ func (r *ManticoreNERRepository) GetDocument(ctx context.Context, docID uint64) 
 			if d, ok := row["doc_id"].(float64); ok {
 				doc.DocID = uint64(d)
 			}
-			if loc, ok := row["ner_loc"].(string); ok {
-				doc.Location = loc
+
+			// Парсим JSON строки обратно в []NEREntity
+			if locStr, ok := row["ner_loc"].(string); ok && locStr != "" && locStr != "null" {
+				var entities []domain.NEREntity
+				if err := json.Unmarshal([]byte(locStr), &entities); err == nil {
+					doc.Location = entities
+				}
 			}
-			if per, ok := row["ner_per"].(string); ok {
-				doc.Person = per
+
+			if perStr, ok := row["ner_per"].(string); ok && perStr != "" && perStr != "null" {
+				var entities []domain.NEREntity
+				if err := json.Unmarshal([]byte(perStr), &entities); err == nil {
+					doc.Person = entities
+				}
 			}
-			if org, ok := row["ner_org"].(string); ok {
-				doc.Org = org
+
+			if orgStr, ok := row["ner_org"].(string); ok && orgStr != "" && orgStr != "null" {
+				var entities []domain.NEREntity
+				if err := json.Unmarshal([]byte(orgStr), &entities); err == nil {
+					doc.Org = entities
+				}
 			}
+
 			if createdAt, ok := row["created_at"].(float64); ok {
 				doc.CreatedAt = int64(createdAt)
 			}
@@ -173,55 +190,6 @@ func (r *ManticoreNERRepository) UpdateDocument(ctx context.Context, doc *domain
 	return err
 }
 
-// getExistingDocs получает мапу существующих документов через прямой SQL запрос
-func (r *ManticoreNERRepository) getExistingDocs(ctx context.Context, docs []*domain.NERDocument) (map[uint64]uint64, error) {
-	if len(docs) == 0 {
-		return make(map[uint64]uint64), nil
-	}
-
-	// Формируем список doc_id для запроса
-	docIDs := make([]string, len(docs))
-	for i, doc := range docs {
-		docIDs[i] = fmt.Sprintf("%d", doc.DocID)
-	}
-
-	query := fmt.Sprintf("SELECT id, doc_id FROM %s WHERE doc_id IN (%s)",
-		r.tableName, strings.Join(docIDs, ","))
-
-	req := r.apiClient.UtilsAPI.Sql(ctx).Body(query)
-	req = req.RawResponse(false)
-
-	resp, _, err := r.apiClient.UtilsAPI.SqlExecute(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query existing docs: %w", err)
-	}
-
-	existingDocs := make(map[uint64]uint64)
-
-	if resp != nil {
-		actual := resp.GetActualInstance()
-		if arr, ok := actual.([]map[string]interface{}); ok {
-			for _, row := range arr {
-				var id, docID uint64
-				if idVal, ok := row["id"].(float64); ok {
-					id = uint64(idVal)
-				}
-				if docIDVal, ok := row["doc_id"].(float64); ok {
-					docID = uint64(docIDVal)
-				}
-				if id > 0 && docID > 0 {
-					existingDocs[docID] = id
-				}
-			}
-		}
-	}
-
-	r.logger.Debug("found existing NER docs",
-		ports.Int("total", len(existingDocs)))
-
-	return existingDocs, nil
-}
-
 // BulkUpdate массовое обновление NER документов
 func (r *ManticoreNERRepository) BulkUpdate(ctx context.Context, docs []*domain.NERDocument) (*domain.BatchResult, error) {
 	result := domain.NewBatchResult()
@@ -239,18 +207,26 @@ func (r *ManticoreNERRepository) BulkUpdate(ctx context.Context, docs []*domain.
 		return nil, fmt.Errorf("failed to get existing docs: %w", err)
 	}
 
-	// Формируем bulk запрос
+	// Формируем NDJSON для bulk запроса
 	var bulkLines []string
 	now := time.Now().Unix()
 
 	for _, doc := range docs {
+		// Устанавливаем временные метки
+		doc.UpdatedAt = now
+		if doc.CreatedAt == 0 {
+			doc.CreatedAt = now
+		}
+
 		if existingID, ok := existingDocs[doc.DocID]; ok {
 			// UPDATE существующего документа
+			doc.ID = existingID
+			// Для update нужны только изменяемые поля
 			updateDoc := map[string]interface{}{
-				"ner_loc":    doc.Location,
+				"ner_loc":    doc.Location, // Прямая передача слайса!
 				"ner_per":    doc.Person,
 				"ner_org":    doc.Org,
-				"updated_at": now,
+				"updated_at": doc.UpdatedAt,
 			}
 
 			updateOp := map[string]interface{}{
@@ -263,29 +239,16 @@ func (r *ManticoreNERRepository) BulkUpdate(ctx context.Context, docs []*domain.
 			jsonLine, _ := json.Marshal(updateOp)
 			bulkLines = append(bulkLines, string(jsonLine))
 		} else {
-			// INSERT нового документа
-			insertDoc := map[string]interface{}{
-				"doc_id":     doc.DocID,
-				"ner_loc":    doc.Location,
-				"ner_per":    doc.Person,
-				"ner_org":    doc.Org,
-				"created_at": now,
-				"updated_at": now,
-			}
-
+			// INSERT нового документа - используем ToMap()
 			insertOp := map[string]interface{}{
 				"insert": map[string]interface{}{
 					"index": r.tableName,
-					"doc":   insertDoc,
+					"doc":   doc.ToMap(), // ToMap теперь возвращает правильную структуру
 				},
 			}
 			jsonLine, _ := json.Marshal(insertOp)
 			bulkLines = append(bulkLines, string(jsonLine))
 		}
-	}
-
-	if len(bulkLines) == 0 {
-		return result, nil
 	}
 
 	bulkBody := strings.Join(bulkLines, "\n") + "\n"
@@ -296,34 +259,34 @@ func (r *ManticoreNERRepository) BulkUpdate(ctx context.Context, docs []*domain.
 			ports.String("sample", bulkLines[0]))
 	}
 
-	bulkResp, _, err := r.apiClient.IndexAPI.Bulk(ctx).Body(bulkBody).Execute()
+	// Отправляем через официальный клиент
+	bulkResp, httpResp, err := r.apiClient.IndexAPI.Bulk(ctx).Body(bulkBody).Execute()
+
 	if err != nil {
+		if httpResp != nil {
+			body, _ := io.ReadAll(httpResp.Body)
+			return nil, fmt.Errorf("bulk request failed (status %d): %s",
+				httpResp.StatusCode, string(body))
+		}
 		return nil, fmt.Errorf("bulk request failed: %w", err)
 	}
 
 	// Анализируем ответ
 	if bulkResp.Items != nil {
 		for _, item := range bulkResp.Items {
-			// Проверяем оба типа операций
-			for _, op := range []string{"update", "insert"} {
-				if data, ok := item[op]; ok {
-					if dataMap, ok := data.(map[string]interface{}); ok {
-						if resultStr, ok := dataMap["result"]; ok {
-							if resultStr == "updated" || resultStr == "created" {
-								result.AddSuccess()
-							} else {
-								// Извлекаем ID для failed записи
-								var docID uint64
-								if id, ok := dataMap["_id"]; ok {
-									switch v := id.(type) {
-									case float64:
-										docID = uint64(v)
-									}
-								}
-								result.AddFailed(docID,
-									fmt.Errorf("%s failed: %v", op, resultStr),
-									domain.ErrorTypeManticore, 1)
-							}
+			if update, ok := item["update"]; ok {
+				if updateMap, ok := update.(map[string]interface{}); ok {
+					if resultStr, ok := updateMap["result"]; ok {
+						if resultStr == "updated" {
+							result.AddSuccess()
+						}
+					}
+				}
+			} else if insert, ok := item["insert"]; ok {
+				if insertMap, ok := insert.(map[string]interface{}); ok {
+					if resultStr, ok := insertMap["result"]; ok {
+						if resultStr == "created" {
+							result.AddSuccess()
 						}
 					}
 				}
@@ -331,15 +294,67 @@ func (r *ManticoreNERRepository) BulkUpdate(ctx context.Context, docs []*domain.
 		}
 	}
 
-	if bulkResp.Errors != nil && *bulkResp.Errors {
-		r.logger.Warn("NER bulk operation had errors",
-			ports.Any("error", bulkResp.Error))
+	return result, nil
+}
+
+// getExistingDocs получает существующие документы
+func (r *ManticoreNERRepository) getExistingDocs(ctx context.Context, docs []*domain.NERDocument) (map[uint64]uint64, error) {
+	if len(docs) == 0 {
+		return make(map[uint64]uint64), nil
 	}
 
-	r.logger.Info("NER bulk update completed",
-		ports.Int("total", result.Total),
-		ports.Int("success", result.Success),
-		ports.Int("failed", result.Failed))
+	// Формируем список doc_id
+	docIDs := make([]interface{}, len(docs))
+	for i, doc := range docs {
+		docIDs[i] = doc.DocID
+	}
 
-	return result, nil
+	request := map[string]interface{}{
+		"table": r.tableName,
+		"query": map[string]interface{}{
+			"in": map[string]interface{}{
+				"doc_id": docIDs,
+			},
+		},
+		"limit": len(docs),
+	}
+
+	jsonData, _ := json.Marshal(request)
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("http://%s:%d/search", r.client.config.Host, r.client.config.Port),
+		bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	httpResp, err := r.client.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer httpResp.Body.Close()
+
+	var searchResp struct {
+		Hits struct {
+			Hits []struct {
+				ID     json.Number `json:"_id"`
+				Source struct {
+					DocID uint64 `json:"doc_id"`
+				} `json:"_source"`
+			} `json:"hits"`
+		} `json:"hits"`
+	}
+
+	if err := json.NewDecoder(httpResp.Body).Decode(&searchResp); err != nil {
+		return nil, err
+	}
+
+	existingDocs := make(map[uint64]uint64)
+	for _, hit := range searchResp.Hits.Hits {
+		id, _ := strconv.ParseUint(string(hit.ID), 10, 64)
+		existingDocs[hit.Source.DocID] = id
+	}
+
+	return existingDocs, nil
 }

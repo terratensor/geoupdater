@@ -355,23 +355,41 @@ func runNERMode(app *AppContext, filenames []string, modeFlag *string) {
 		nerConfig,
 	)
 
-	// Обрабатываем файлы
+	// Создаем директорию для отчетов
+	if err := os.MkdirAll(app.reportsDir, 0755); err != nil {
+		app.log.Warn("failed to create reports directory",
+			ports.String("dir", app.reportsDir),
+			ports.Error(err))
+	}
+
+	// Обрабатываем файлы с отчетом
 	start := time.Now()
-	result, err := nerProcessor.ProcessFiles(app.ctx, filenames)
+	report, err := nerProcessor.ProcessFilesWithReport(app.ctx, filenames)
 	if err != nil {
 		app.log.Error("NER processing failed", ports.Error(err))
 	}
 
+	// Сохраняем отчет
+	if report != nil {
+		if err := report.Save(app.reportsDir); err != nil {
+			app.log.Error("failed to save NER report",
+				ports.String("dir", app.reportsDir),
+				ports.Error(err))
+		} else {
+			app.log.Info("NER report saved",
+				ports.String("dir", app.reportsDir),
+				ports.String("file", fmt.Sprintf("ner_report_%s.json", start.Format("20060102_150405"))))
+		}
+	}
+
 	duration := time.Since(start)
+	stats := nerProcessor.GetStats()
 
 	app.log.Info("NER processing completed",
-		ports.String("summary", result.Summary()),
 		ports.Int64("duration_ms", duration.Milliseconds()))
-
-	stats := nerProcessor.GetStats()
 	app.log.Info("NER final statistics", ports.Any("stats", stats))
 
-	if result.Failed > 0 {
+	if report != nil && report.Stats.TotalFailed > 0 {
 		os.Exit(1)
 	}
 }
