@@ -47,6 +47,12 @@ type Config struct {
 	EnableReprocess  bool          `envconfig:"ENABLE_REPROCESS" default:"true"`
 	ReprocessWorkers int           `envconfig:"REPROCESS_WORKERS" default:"3"`
 	MaxFailedAge     time.Duration `envconfig:"MAX_FAILED_AGE" default:"168h"` // 7 days
+
+	// NER configuration
+	NERMode        bool   `envconfig:"NER_MODE" default:"false"`
+	NERTableSuffix string `envconfig:"NER_TABLE_SUFFIX" default:"_ner"`
+	NERBatchSize   int    `envconfig:"NER_BATCH_SIZE" default:"1000"`
+	NERWorkers     int    `envconfig:"NER_WORKERS" default:"5"`
 }
 
 // Load загружает конфигурацию из переменных окружения и .env файла
@@ -101,6 +107,16 @@ func (c *Config) Validate() error {
 	if c.Workers <= 0 {
 		log.Println("warning: invalid WORKERS, using default 5")
 		c.Workers = 5
+	}
+
+	if c.NERBatchSize <= 0 {
+		log.Println("warning: invalid NER_BATCH_SIZE, using default 1000")
+		c.NERBatchSize = 1000
+	}
+
+	if c.NERWorkers <= 0 {
+		log.Println("warning: invalid NER_WORKERS, using default 5")
+		c.NERWorkers = 5
 	}
 
 	return nil
