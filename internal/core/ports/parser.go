@@ -20,6 +20,12 @@ type Parser interface {
 
 	// ParseReader читает данные из io.Reader (для тестирования)
 	ParseReader(ctx context.Context, reader io.Reader) (<-chan *domain.GeoUpdateData, <-chan error)
+
+	// ParseNERFile читает NER файл и возвращает канал с данными
+	ParseNERFile(ctx context.Context, filename string) (<-chan *domain.NERData, <-chan error)
+
+	// ParseNERReader читает NER данные из io.Reader (для тестирования)
+	ParseNERReader(ctx context.Context, reader io.Reader) (<-chan *domain.NERData, <-chan error)
 }
 
 // ParserConfig конфигурация парсера
