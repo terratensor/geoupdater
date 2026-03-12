@@ -19,6 +19,7 @@ import (
 	"github.com/terratensor/geoupdater/internal/app/service"
 	"github.com/terratensor/geoupdater/internal/core/domain"
 	"github.com/terratensor/geoupdater/internal/core/ports"
+	"github.com/terratensor/geoupdater/internal/version"
 )
 
 func main() {
@@ -29,14 +30,14 @@ func main() {
 		pattern     = flag.String("pattern", "*.ndjson", "file pattern to match")
 		mode        = flag.String("mode", "", "update mode: replace or merge (overrides config)")
 		reprocess   = flag.Bool("reprocess", false, "reprocess failed records")
-		versionFlag = flag.Bool("version", false, "show version")
+		versionFlag = flag.Bool("version", false, "show version information")
 		reportsDir  = flag.String("reports", "reports", "directory to save processing reports")
 	)
 	flag.Parse()
 
 	// Версия
 	if *versionFlag {
-		fmt.Println("GeoUpdater v1.0.0")
+		fmt.Println(version.Info())
 		return
 	}
 

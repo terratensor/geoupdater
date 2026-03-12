@@ -10,6 +10,7 @@ import (
 
 	"github.com/terratensor/geoupdater/internal/core/domain"
 	"github.com/terratensor/geoupdater/internal/core/ports"
+	"github.com/terratensor/geoupdater/internal/version"
 )
 
 // UpdateProcessor реализует бизнес-логику обновления документов
@@ -553,7 +554,7 @@ func (p *UpdateProcessor) ProcessFilesWithReport(ctx context.Context, filenames 
 	p.logger.Info("processing multiple files", ports.Int("count", len(filenames)))
 
 	report := domain.NewProcessingReport(
-		"1.0.0",
+		version.Short(), // Передаём версию
 		p.config.UpdateMode,
 		p.config.Workers,
 		p.config.BatchSize,
