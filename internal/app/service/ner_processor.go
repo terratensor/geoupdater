@@ -166,8 +166,6 @@ func (p *NERProcessor) ProcessDocuments(ctx context.Context, dataChan <-chan *do
 func (p *NERProcessor) processBatch(ctx context.Context, batch []*domain.NERData, updateChan chan<- *domain.NERDocument) {
 	p.logger.Debug("processing NER batch", ports.Int("batch_size", len(batch)))
 
-	docs := make([]*domain.NERDocument, 0, len(batch))
-
 	for _, data := range batch {
 		doc, err := domain.NewNERDocumentFromData(data)
 		if err != nil {
