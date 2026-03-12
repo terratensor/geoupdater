@@ -250,68 +250,21 @@ func (p *Parser) ParseReader(ctx context.Context, reader io.Reader) (<-chan *dom
 
 // ParseNERLine парсит строку в NERData
 func (p *Parser) ParseNERLine(line []byte) (*domain.NERData, error) {
-	// Сначала парсим в map для гибкой обработки doc_id
-	var raw map[string]interface{}
+	var data domain.NERData
 
 	decoder := json.NewDecoder(bytes.NewReader(line))
 	decoder.UseNumber()
 
-	if err := decoder.Decode(&raw); err != nil {
+	if err := decoder.Decode(&data); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal NER JSON: %w", err)
 	}
 
-	// Парсим doc_id (может быть строкой или числом)
-	var docID uint64
-	if idVal, ok := raw["doc_id"]; ok {
-		switch v := idVal.(type) {
-		case string:
-			docID, _ = strconv.ParseUint(v, 10, 64)
-			p.logger.Debug("parsed doc_id from string",
-				ports.String("raw", v),
-				ports.Uint64("parsed", docID))
-		case json.Number:
-			docID, _ = strconv.ParseUint(string(v), 10, 64)
-			p.logger.Debug("parsed doc_id from json.Number",
-				ports.String("raw", string(v)),
-				ports.Uint64("parsed", docID))
-		case float64:
-			docID = uint64(v)
-			p.logger.Debug("parsed doc_id from float64",
-				ports.Float64("raw", v),
-				ports.Uint64("parsed", docID))
-		default:
-			return nil, fmt.Errorf("doc_id has unexpected type: %T", v)
-		}
-	} else {
+	// Валидация
+	if data.DocID == 0 {
 		return nil, fmt.Errorf("doc_id is required")
 	}
 
-	// Парсим NER массивы
-	var location, person, org []domain.NEREntity
-
-	if loc, ok := raw["ner_loc"]; ok && loc != nil {
-		locBytes, _ := json.Marshal(loc)
-		json.Unmarshal(locBytes, &location)
-	}
-
-	if per, ok := raw["ner_per"]; ok && per != nil {
-		perBytes, _ := json.Marshal(per)
-		json.Unmarshal(perBytes, &person)
-	}
-
-	if or, ok := raw["ner_org"]; ok && or != nil {
-		orgBytes, _ := json.Marshal(or)
-		json.Unmarshal(orgBytes, &org)
-	}
-
-	data := &domain.NERData{
-		DocID:    docID,
-		Location: location,
-		Person:   person,
-		Org:      org,
-	}
-
-	return data, nil
+	return &data, nil
 }
 
 // ParseNERFile читает NER файл и возвращает канал с данными
