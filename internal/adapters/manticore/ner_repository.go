@@ -31,13 +31,31 @@ func NewNERRepository(client *Client, baseTableName string, logger ports.Logger)
 	}
 }
 
+// tableExists проверяет существование таблицы через SHOW CREATE TABLE
+func (r *ManticoreNERRepository) tableExists(ctx context.Context) (bool, error) {
+	showCreateTableQuery := fmt.Sprintf("SHOW CREATE TABLE %s", r.tableName)
+	req := r.apiClient.UtilsAPI.Sql(ctx).Body(showCreateTableQuery)
+	req = req.RawResponse(true)
+
+	_, _, err := r.apiClient.UtilsAPI.SqlExecute(req)
+
+	if err == nil {
+		return true, nil
+	}
+
+	// Если ошибка - таблицы нет
+	return false, nil
+}
+
 // EnsureTable создает таблицу если не существует
 func (r *ManticoreNERRepository) EnsureTable(ctx context.Context) error {
-	// Проверяем существование таблицы
-	query := fmt.Sprintf("SHOW TABLES LIKE '%s'", r.tableName)
-	resp, _, err := r.apiClient.UtilsAPI.Sql(ctx).Body(query).Execute()
-	if err == nil && resp != nil {
-		// Таблица существует
+	// Проверяем существование таблицы через SHOW CREATE TABLE
+	exists, err := r.tableExists(ctx)
+	if err != nil {
+		r.logger.Debug("error checking table existence", ports.Error(err))
+	}
+
+	if exists {
 		r.logger.Info("NER table already exists", ports.String("table", r.tableName))
 		return nil
 	}
@@ -55,7 +73,10 @@ func (r *ManticoreNERRepository) EnsureTable(ctx context.Context) error {
 
 	r.logger.Info("creating NER table", ports.String("table", r.tableName))
 
-	_, _, err = r.apiClient.UtilsAPI.Sql(ctx).Body(createQuery).Execute()
+	req := r.apiClient.UtilsAPI.Sql(ctx).Body(createQuery)
+	req = req.RawResponse(true)
+
+	_, _, err = r.apiClient.UtilsAPI.SqlExecute(req)
 	if err != nil {
 		return fmt.Errorf("failed to create NER table: %w", err)
 	}
@@ -68,12 +89,49 @@ func (r *ManticoreNERRepository) EnsureTable(ctx context.Context) error {
 func (r *ManticoreNERRepository) GetDocument(ctx context.Context, docID uint64) (*domain.NERDocument, error) {
 	query := fmt.Sprintf("SELECT * FROM %s WHERE doc_id = %d LIMIT 1", r.tableName, docID)
 
-	resp, _, err := r.apiClient.UtilsAPI.Sql(ctx).Body(query).RawResponse(false).Execute()
+	req := r.apiClient.UtilsAPI.Sql(ctx).Body(query)
+	req = req.RawResponse(false)
+
+	resp, _, err := r.apiClient.UtilsAPI.SqlExecute(req)
 	if err != nil {
 		return nil, err
 	}
 
-	return r.parseNERResponse(*resp)
+	// Парсим ответ как массив
+	if resp != nil {
+		// Пробуем получить как массив
+		actual := resp.GetActualInstance()
+		if arr, ok := actual.([]map[string]interface{}); ok && len(arr) > 0 {
+			row := arr[0]
+			doc := &domain.NERDocument{}
+
+			if id, ok := row["id"].(float64); ok {
+				doc.ID = uint64(id)
+			}
+			if d, ok := row["doc_id"].(float64); ok {
+				doc.DocID = uint64(d)
+			}
+			if loc, ok := row["ner_loc"].(string); ok {
+				doc.Location = loc
+			}
+			if per, ok := row["ner_per"].(string); ok {
+				doc.Person = per
+			}
+			if org, ok := row["ner_org"].(string); ok {
+				doc.Org = org
+			}
+			if createdAt, ok := row["created_at"].(float64); ok {
+				doc.CreatedAt = int64(createdAt)
+			}
+			if updatedAt, ok := row["updated_at"].(float64); ok {
+				doc.UpdatedAt = int64(updatedAt)
+			}
+
+			return doc, nil
+		}
+	}
+
+	return nil, ports.ErrNotFound
 }
 
 // UpdateDocument обновляет или вставляет NER документ
@@ -84,11 +142,13 @@ func (r *ManticoreNERRepository) UpdateDocument(ctx context.Context, doc *domain
 		return err
 	}
 
+	now := time.Now().Unix()
+
 	if existing != nil {
 		// Обновляем существующий
 		doc.ID = existing.ID
 		doc.CreatedAt = existing.CreatedAt
-		doc.UpdatedAt = time.Now().Unix()
+		doc.UpdatedAt = now
 
 		updateDoc := map[string]interface{}{
 			"ner_loc":    doc.Location,
@@ -105,12 +165,61 @@ func (r *ManticoreNERRepository) UpdateDocument(ctx context.Context, doc *domain
 	}
 
 	// Вставляем новый
-	doc.CreatedAt = time.Now().Unix()
-	doc.UpdatedAt = doc.CreatedAt
+	doc.CreatedAt = now
+	doc.UpdatedAt = now
 
 	insertRequest := Manticoresearch.NewInsertDocumentRequest(r.tableName, doc.ToMap())
 	_, _, err = r.apiClient.IndexAPI.Insert(ctx).InsertDocumentRequest(*insertRequest).Execute()
 	return err
+}
+
+// getExistingDocs получает мапу существующих документов через прямой SQL запрос
+func (r *ManticoreNERRepository) getExistingDocs(ctx context.Context, docs []*domain.NERDocument) (map[uint64]uint64, error) {
+	if len(docs) == 0 {
+		return make(map[uint64]uint64), nil
+	}
+
+	// Формируем список doc_id для запроса
+	docIDs := make([]string, len(docs))
+	for i, doc := range docs {
+		docIDs[i] = fmt.Sprintf("%d", doc.DocID)
+	}
+
+	query := fmt.Sprintf("SELECT id, doc_id FROM %s WHERE doc_id IN (%s)",
+		r.tableName, strings.Join(docIDs, ","))
+
+	req := r.apiClient.UtilsAPI.Sql(ctx).Body(query)
+	req = req.RawResponse(false)
+
+	resp, _, err := r.apiClient.UtilsAPI.SqlExecute(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query existing docs: %w", err)
+	}
+
+	existingDocs := make(map[uint64]uint64)
+
+	if resp != nil {
+		actual := resp.GetActualInstance()
+		if arr, ok := actual.([]map[string]interface{}); ok {
+			for _, row := range arr {
+				var id, docID uint64
+				if idVal, ok := row["id"].(float64); ok {
+					id = uint64(idVal)
+				}
+				if docIDVal, ok := row["doc_id"].(float64); ok {
+					docID = uint64(docIDVal)
+				}
+				if id > 0 && docID > 0 {
+					existingDocs[docID] = id
+				}
+			}
+		}
+	}
+
+	r.logger.Debug("found existing NER docs",
+		ports.Int("total", len(existingDocs)))
+
+	return existingDocs, nil
 }
 
 // BulkUpdate массовое обновление NER документов
@@ -137,33 +246,37 @@ func (r *ManticoreNERRepository) BulkUpdate(ctx context.Context, docs []*domain.
 	for _, doc := range docs {
 		if existingID, ok := existingDocs[doc.DocID]; ok {
 			// UPDATE существующего документа
-			doc.ID = existingID
-			doc.UpdatedAt = now
-			// created_at не меняем
+			updateDoc := map[string]interface{}{
+				"ner_loc":    doc.Location,
+				"ner_per":    doc.Person,
+				"ner_org":    doc.Org,
+				"updated_at": now,
+			}
 
 			updateOp := map[string]interface{}{
 				"update": map[string]interface{}{
 					"index": r.tableName,
-					"id":    doc.ID,
-					"doc": map[string]interface{}{
-						"ner_loc":    doc.Location,
-						"ner_per":    doc.Person,
-						"ner_org":    doc.Org,
-						"updated_at": doc.UpdatedAt,
-					},
+					"id":    existingID,
+					"doc":   updateDoc,
 				},
 			}
 			jsonLine, _ := json.Marshal(updateOp)
 			bulkLines = append(bulkLines, string(jsonLine))
 		} else {
 			// INSERT нового документа
-			doc.CreatedAt = now
-			doc.UpdatedAt = now
+			insertDoc := map[string]interface{}{
+				"doc_id":     doc.DocID,
+				"ner_loc":    doc.Location,
+				"ner_per":    doc.Person,
+				"ner_org":    doc.Org,
+				"created_at": now,
+				"updated_at": now,
+			}
 
 			insertOp := map[string]interface{}{
 				"insert": map[string]interface{}{
 					"index": r.tableName,
-					"doc":   doc.ToMap(),
+					"doc":   insertDoc,
 				},
 			}
 			jsonLine, _ := json.Marshal(insertOp)
@@ -229,84 +342,4 @@ func (r *ManticoreNERRepository) BulkUpdate(ctx context.Context, docs []*domain.
 		ports.Int("failed", result.Failed))
 
 	return result, nil
-}
-
-// getExistingDocs получает мапу существующих документов по doc_id
-func (r *ManticoreNERRepository) getExistingDocs(ctx context.Context, docs []*domain.NERDocument) (map[uint64]uint64, error) {
-	if len(docs) == 0 {
-		return make(map[uint64]uint64), nil
-	}
-
-	// Формируем список doc_id для запроса
-	docIDs := make([]string, len(docs))
-	for i, doc := range docs {
-		docIDs[i] = fmt.Sprintf("%d", doc.DocID)
-	}
-
-	query := fmt.Sprintf("SELECT id, doc_id FROM %s WHERE doc_id IN (%s)",
-		r.tableName, strings.Join(docIDs, ","))
-
-	resp, _, err := r.apiClient.UtilsAPI.Sql(ctx).Body(query).RawResponse(false).Execute()
-	if err != nil {
-		return nil, err
-	}
-
-	existingDocs := make(map[uint64]uint64)
-	actual := resp.GetActualInstance()
-
-	if arr, ok := actual.([]map[string]interface{}); ok {
-		for _, row := range arr {
-			var id, docID uint64
-			if idVal, ok := row["id"].(float64); ok {
-				id = uint64(idVal)
-			}
-			if docIDVal, ok := row["doc_id"].(float64); ok {
-				docID = uint64(docIDVal)
-			}
-			if id > 0 && docID > 0 {
-				existingDocs[docID] = id
-			}
-		}
-	}
-
-	r.logger.Debug("found existing NER docs",
-		ports.Int("total", len(existingDocs)))
-
-	return existingDocs, nil
-}
-
-// parseNERResponse парсит SQL ответ в NERDocument
-func (r *ManticoreNERRepository) parseNERResponse(resp Manticoresearch.SqlResponse) (*domain.NERDocument, error) {
-	actual := resp.GetActualInstance()
-
-	if arr, ok := actual.([]map[string]interface{}); ok && len(arr) > 0 {
-		row := arr[0]
-		doc := &domain.NERDocument{}
-
-		if id, ok := row["id"].(float64); ok {
-			doc.ID = uint64(id)
-		}
-		if docID, ok := row["doc_id"].(float64); ok {
-			doc.DocID = uint64(docID)
-		}
-		if loc, ok := row["ner_loc"].(string); ok {
-			doc.Location = loc
-		}
-		if per, ok := row["ner_per"].(string); ok {
-			doc.Person = per
-		}
-		if org, ok := row["ner_org"].(string); ok {
-			doc.Org = org
-		}
-		if createdAt, ok := row["created_at"].(float64); ok {
-			doc.CreatedAt = int64(createdAt)
-		}
-		if updatedAt, ok := row["updated_at"].(float64); ok {
-			doc.UpdatedAt = int64(updatedAt)
-		}
-
-		return doc, nil
-	}
-
-	return nil, ports.ErrNotFound
 }
