@@ -81,19 +81,20 @@ func (p *NERProcessor) ProcessDocuments(ctx context.Context, dataChan <-chan *do
 	p.logger.Info("starting NER document processing")
 
 	overallResult := domain.NewBatchResult()
+	documentCount := 0
 
 	// Канал для передачи документов на обновление
 	updateChan := make(chan *domain.NERDocument, p.config.BatchSize*2)
 	resultChan := make(chan *domain.BatchResult, p.config.Workers)
 
-	// Запускаем воркеров для обновления
+	// Запускаем воркеров
 	var wgWorkers sync.WaitGroup
 	for i := 0; i < p.config.Workers; i++ {
 		wgWorkers.Add(1)
 		go p.updateWorker(ctx, i, updateChan, resultChan, &wgWorkers)
 	}
 
-	// Горутина для сбора результатов
+	// Сбор результатов
 	resultDone := make(chan struct{})
 	go func() {
 		for result := range resultChan {
@@ -104,22 +105,21 @@ func (p *NERProcessor) ProcessDocuments(ctx context.Context, dataChan <-chan *do
 		close(resultDone)
 	}()
 
-	// Основной цикл обработки данных
+	// Основной цикл обработки
 	processDone := make(chan struct{})
 	go func() {
 		defer close(updateChan)
 		defer close(processDone)
 
 		batch := make([]*domain.NERData, 0, p.config.BatchSize)
-		batchCount := 0
 
 		for data := range dataChan {
-			batchCount++
+			documentCount++
 
 			select {
 			case <-ctx.Done():
 				p.logger.Info("context done, stopping NER processing",
-					ports.Int("processed", batchCount))
+					ports.Int("processed", documentCount))
 				return
 			default:
 			}
@@ -132,16 +132,15 @@ func (p *NERProcessor) ProcessDocuments(ctx context.Context, dataChan <-chan *do
 			}
 		}
 
-		// Обрабатываем остаток
 		if len(batch) > 0 {
 			p.processBatch(ctx, batch, updateChan)
 		}
 
 		p.logger.Info("finished processing all NER data",
-			ports.Int("total_records", batchCount))
+			ports.Int("total_records", documentCount))
 	}()
 
-	// Ждем завершения
+	// Ожидание завершения
 	<-processDone
 	p.logger.Debug("NER processing done, waiting for workers")
 
@@ -152,9 +151,15 @@ func (p *NERProcessor) ProcessDocuments(ctx context.Context, dataChan <-chan *do
 	<-resultDone
 	p.logger.Debug("all NER results collected")
 
+	// Устанавливаем правильное количество документов
+	overallResult.Total = documentCount
+	if overallResult.Failed == 0 {
+		overallResult.Success = documentCount
+	}
+
 	// Обновляем статистику
 	p.mu.Lock()
-	p.stats.TotalProcessed += int64(overallResult.Total)
+	p.stats.TotalProcessed += int64(documentCount)
 	p.stats.TotalSuccess += int64(overallResult.Success)
 	p.stats.TotalFailed += int64(overallResult.Failed)
 	p.stats.TotalSkipped += int64(overallResult.Skipped)
@@ -169,10 +174,8 @@ func (p *NERProcessor) processBatch(ctx context.Context, batch []*domain.NERData
 	p.logger.Debug("processing NER batch", ports.Int("batch_size", len(batch)))
 
 	for _, data := range batch {
-		// NewNERDocumentFromData теперь возвращает только документ, без ошибки
 		doc := domain.NewNERDocumentFromData(data)
 
-		// Валидация при необходимости
 		if doc.DocID == 0 {
 			p.logger.Error("invalid document: missing doc_id",
 				ports.Any("data", data))
@@ -220,7 +223,6 @@ func (p *NERProcessor) updateWorker(ctx context.Context, id int,
 				ports.Int("batch_size", len(batch)),
 				ports.Error(err))
 
-			// Добавляем все документы как failed
 			for _, doc := range batch {
 				batchResult.AddFailed(doc.DocID, err, domain.ErrorTypeManticore, 1)
 			}
@@ -262,12 +264,11 @@ func (p *NERProcessor) updateWorker(ctx context.Context, id int,
 
 // saveFailedRecord сохраняет неудачную NER запись
 func (p *NERProcessor) saveFailedRecord(ctx context.Context, data *domain.NERData, err error, filename string) {
-	if p.failedRepo == nil {
+	if p.failedRepo == nil || !p.config.SaveFailed {
 		return
 	}
 
-	// Конвертируем NERData в GeoUpdateData для совместимости с failed репозиторием
-	// Это временное решение, в будущем можно создать отдельный failed репозиторий для NER
+	// Конвертируем NERData в GeoUpdateData для совместимости
 	geoData := &domain.GeoUpdateData{
 		DocID:           data.DocID,
 		GeohashesString: []string{},
@@ -308,12 +309,6 @@ func (p *NERProcessor) ProcessFile(ctx context.Context, filename string) (*domai
 		return nil, fmt.Errorf("failed to process NER documents: %w", err)
 	}
 
-	result.Timestamp = time.Now()
-
-	p.logger.Info("NER file processing completed",
-		ports.String("filename", filename),
-		ports.String("result", result.Summary()))
-
 	p.mu.Lock()
 	p.stats.TotalFiles++
 	p.mu.Unlock()
@@ -321,118 +316,20 @@ func (p *NERProcessor) ProcessFile(ctx context.Context, filename string) (*domai
 	return result, nil
 }
 
-// ProcessFiles обрабатывает несколько NER файлов
-func (p *NERProcessor) ProcessFiles(ctx context.Context, filenames []string) (*domain.BatchResult, error) {
-	p.logger.Info("processing multiple NER files", ports.Int("count", len(filenames)))
-
-	overallResult := domain.NewBatchResult()
-
-	for _, filename := range filenames {
-		select {
-		case <-ctx.Done():
-			return overallResult, ctx.Err()
-		default:
-			// Парсим файл
-			dataChan, errChan := p.parser.ParseNERFile(ctx, filename)
-
-			// Запускаем горутину для сбора ошибок
-			go func() {
-				for err := range errChan {
-					p.logger.Error("NER parse error",
-						ports.String("filename", filename),
-						ports.Error(err))
-				}
-			}()
-
-			// Обрабатываем документы напрямую из канала
-			result, err := p.ProcessDocuments(ctx, dataChan)
-			if err != nil {
-				p.logger.Error("failed to process NER file",
-					ports.String("filename", filename),
-					ports.Error(err))
-			}
-			if result != nil {
-				overallResult.Merge(result)
-			}
-		}
-	}
-
-	return overallResult, nil
-}
-
-// ProcessFilesWithReport обрабатывает несколько NER файлов и возвращает отчет
-func (p *NERProcessor) ProcessFilesWithReport(ctx context.Context, filenames []string) (*domain.ProcessingReport, error) {
-	p.logger.Info("processing multiple NER files", ports.Int("count", len(filenames)))
-
-	report := domain.NewProcessingReport(
-		version.Short(),
-		"ner",
-		p.config.Workers,
-		p.config.BatchSize,
-	)
-
-	totalDocuments := 0
-	overallResult := domain.NewBatchResult()
-
-	for _, filename := range filenames {
-		select {
-		case <-ctx.Done():
-			report.Complete()
-			return report, ctx.Err()
-		default:
-			fileReport, result, err := p.processFileWithReport(ctx, filename)
-			if err != nil {
-				p.logger.Error("failed to process NER file",
-					ports.String("filename", filename),
-					ports.Error(err))
-				fileReport = &domain.FileReport{
-					Filename: filename,
-					Errors:   1,
-				}
-			}
-			if fileReport != nil {
-				report.AddFile(*fileReport)
-			}
-			if result != nil {
-				overallResult.Merge(result)
-				totalDocuments += fileReport.Valid
-			}
-		}
-	}
-
-	report.Complete()
-
-	// Выводим сводку в консоль
-	fmt.Println("\n=== NER Processing Report ===")
-	fmt.Printf("Version:     %s\n", report.Version)
-	fmt.Printf("Mode:        %s\n", report.Mode)
-	fmt.Printf("Duration:    %s\n", report.Duration)
-	fmt.Printf("Files:       %d\n", report.TotalFiles)
-	fmt.Printf("Documents:   %d\n", totalDocuments)
-	fmt.Printf("Success:     %d\n", overallResult.Success)
-	fmt.Printf("Failed:      %d\n", overallResult.Failed)
-	fmt.Printf("Skipped:     %d\n", overallResult.Skipped)
-	fmt.Println("================================")
-
-	return report, nil
-}
-
-// processFileWithReport обрабатывает один NER файл и возвращает отчет
+// processFileWithReport обрабатывает файл и возвращает детальный отчет
 func (p *NERProcessor) processFileWithReport(ctx context.Context, filename string) (*domain.FileReport, *domain.BatchResult, error) {
 	p.logger.Info("processing NER file", ports.String("filename", filename))
 
 	startTime := time.Now()
 
-	// Получаем размер файла
 	fileInfo, err := os.Stat(filename)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to stat file: %w", err)
 	}
 
-	// Парсим файл и собираем данные
+	// Парсим файл и собираем все данные для подсчета
 	dataChan, errChan := p.parser.ParseNERFile(ctx, filename)
 
-	// Собираем все данные в слайс, чтобы знать количество
 	var allData []*domain.NERData
 	var firstID, lastID uint64
 	var parseErrors int
@@ -496,6 +393,87 @@ func (p *NERProcessor) processFileWithReport(ctx context.Context, filename strin
 		ports.String("result", result.Summary()))
 
 	return fileReport, result, nil
+}
+
+// ProcessFiles обрабатывает несколько NER файлов
+func (p *NERProcessor) ProcessFiles(ctx context.Context, filenames []string) (*domain.BatchResult, error) {
+	p.logger.Info("processing multiple NER files", ports.Int("count", len(filenames)))
+
+	overallResult := domain.NewBatchResult()
+
+	for _, filename := range filenames {
+		select {
+		case <-ctx.Done():
+			return overallResult, ctx.Err()
+		default:
+			result, err := p.ProcessFile(ctx, filename)
+			if err != nil {
+				p.logger.Error("failed to process NER file",
+					ports.String("filename", filename),
+					ports.Error(err))
+			}
+			if result != nil {
+				overallResult.Merge(result)
+			}
+		}
+	}
+
+	return overallResult, nil
+}
+
+// ProcessFilesWithReport обрабатывает файлы и возвращает отчет
+func (p *NERProcessor) ProcessFilesWithReport(ctx context.Context, filenames []string) (*domain.ProcessingReport, error) {
+	p.logger.Info("processing multiple NER files", ports.Int("count", len(filenames)))
+
+	report := domain.NewProcessingReport(
+		version.Short(),
+		"ner",
+		p.config.Workers,
+		p.config.BatchSize,
+	)
+
+	totalDocuments := 0
+
+	for _, filename := range filenames {
+		select {
+		case <-ctx.Done():
+			report.Complete()
+			return report, ctx.Err()
+		default:
+			fileReport, result, err := p.processFileWithReport(ctx, filename)
+			if err != nil {
+				p.logger.Error("failed to process NER file",
+					ports.String("filename", filename),
+					ports.Error(err))
+				fileReport = &domain.FileReport{
+					Filename: filename,
+					Errors:   1,
+				}
+			}
+			if fileReport != nil {
+				report.AddFile(*fileReport)
+			}
+			if result != nil {
+				totalDocuments += fileReport.Valid
+			}
+		}
+	}
+
+	report.Complete()
+
+	// Выводим сводку
+	fmt.Println("\n=== NER Processing Report ===")
+	fmt.Printf("Version:     %s\n", report.Version)
+	fmt.Printf("Mode:        %s\n", report.Mode)
+	fmt.Printf("Duration:    %s\n", report.Duration)
+	fmt.Printf("Files:       %d\n", report.TotalFiles)
+	fmt.Printf("Documents:   %d\n", totalDocuments)
+	fmt.Printf("Success:     %d\n", report.Stats.TotalSuccess)
+	fmt.Printf("Failed:      %d\n", report.Stats.TotalFailed)
+	fmt.Printf("Skipped:     %d\n", report.Stats.TotalSkipped)
+	fmt.Println("================================")
+
+	return report, nil
 }
 
 // GetStats возвращает статистику NER обработки
