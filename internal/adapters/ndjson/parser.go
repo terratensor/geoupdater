@@ -355,6 +355,65 @@ func (p *Parser) ParseNERFile(ctx context.Context, filename string) (<-chan *dom
 	return dataChan, errChan
 }
 
+// ParseNERReader читает NER данные из io.Reader (для тестирования)
+func (p *Parser) ParseNERReader(ctx context.Context, reader io.Reader) (<-chan *domain.NERData, <-chan error) {
+	dataChan := make(chan *domain.NERData, p.config.BatchSize)
+	errChan := make(chan error, 1)
+
+	go func() {
+		defer close(dataChan)
+		defer close(errChan)
+
+		bufReader := bufio.NewReaderSize(reader, p.config.MaxLineSize)
+
+		var lineNum int
+
+		for {
+			select {
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			default:
+				line, err := p.readLine(bufReader)
+				if err == io.EOF {
+					return
+				}
+				if err != nil {
+					if !p.config.SkipErrors {
+						errChan <- fmt.Errorf("error reading at line %d: %w", lineNum, err)
+						return
+					}
+					continue
+				}
+
+				lineNum++
+
+				if len(line) == 0 {
+					continue
+				}
+
+				data, err := p.ParseNERLine(line)
+				if err != nil {
+					if !p.config.SkipErrors {
+						errChan <- fmt.Errorf("error parsing NER line %d: %w", lineNum, err)
+						return
+					}
+					continue
+				}
+
+				select {
+				case <-ctx.Done():
+					errChan <- ctx.Err()
+					return
+				case dataChan <- data:
+				}
+			}
+		}
+	}()
+
+	return dataChan, errChan
+}
+
 // fileWorker обрабатывает файлы из канала
 func (p *Parser) fileWorker(ctx context.Context, id int, fileChan <-chan string,
 	dataChan chan<- *domain.GeoUpdateData, errChan chan<- error, wg *sync.WaitGroup) {
